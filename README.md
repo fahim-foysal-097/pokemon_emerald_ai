@@ -1,240 +1,101 @@
-# Pokémon Emerald PPO Agent
+# Pokémon Emerald Reinforcement-Learning Agent
 
-A Gymnasium environment for Pokémon Emerald driven by the mGBA Python core and Stable-Baselines3 PPO. The application can train a shared PPO policy across separate emulator instances or load that policy in watch mode.
+A local Pokémon Emerald agent driven by the mGBA Python core and Stable-Baselines3. It learns from the current screenshot, structured RAM state, a visited-tile map, and an LSTM's hidden state across consecutive decisions. The goal for this training configuration is to rescue Professor Birch and obtain the first Pokémon from a Route 101 start.
 
-## Setup and launch
+The project expects a legally obtained Pokémon Emerald ROM with game code `BPEE`, revision 0, named `PokemonEmerald.gba` beside `main.py`. The ROM and emulator savestates are not included in this source package.
 
-This launcher is a convenience script; it is not required. The script included with this bundle uses the existing `.venv` and your mGBA native build. It does not reinstall dependencies or rebuild mGBA.
+## Image observations work in headless mode
 
-1. Put your legally obtained compatible Pokémon Emerald ROM beside `main.py`, named `PokemonEmerald.gba`. This project expects game code `BPEE`, revision 0.
-2. Make the launcher executable and run it:
+Yes. mGBA renders frames into its framebuffer whether or not a GUI window is shown. `GUI_MODE` controls display and interactive controls, not screenshot creation. The observation code still reads and resizes each frame in `fast_train`, `fast_watch`, and `evaluate`. The neural policy receives:
 
-   ```bash
-   chmod +x run.sh
-   ./run.sh
-   ```
+- **Screen:** a 120 × 80 RGB image of the game.
+- **Structured state:** party size and levels, position/map identifiers, badge/story flags, progress counters, and previous action.
+- **Visited tiles:** a compact map of areas explored in the current episode.
+- **Recurrent memory:** an LSTM state carried across actions, enabling it to learn sequences such as dialogue advancement and battle menus.
 
-The launcher uses `.venv/bin/python`, adds the mGBA build directory to `LD_LIBRARY_PATH`, and forwards command-line arguments to `main.py`. It first looks for `/home/fahim/mgba/build-py311`, then a project-local `.runtime/mgba-build-py311`. To select another build, set `MGBA_BUILD_DIR=/path/to/build-py311`.
+Image observations are arrays processed by the policy's CNN. This is not a remote vision model and does not need the GUI to be open.
 
-You can also launch manually, but you must activate the virtual environment and set `LD_LIBRARY_PATH` yourself:
+## Install/update dependencies
 
-```bash
-source .venv/bin/activate
-export LD_LIBRARY_PATH="/home/fahim/mgba/build-py311${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-python -u main.py --profile fast_train
-```
-
-## One-setting profile switching
-
-You only need **one active `.env` file**. Change `POKEMON_AI_PROFILE` in it, or pass `--profile NAME` to `./run.sh` (or `python main.py`). You no longer need to copy among `.env.fast`, `.env.gui-watch`, or `.env.watch-headless`; those older profile files are not used automatically. After updating, you may delete those old templates with `rm -f .env.fast .env.gui-watch .env.watch-headless` if you want to keep the project folder tidy.
-
-| Profile | What it does | Emulator instances |
-|---|---|---:|
-| `fast_train` | **Default.** Headless PPO training, with TensorBoard enabled. | 4 by default (configurable) |
-| `gui_train` | Train while showing the game. | 1 |
-| `setup` | Human-controlled GUI to finish the introduction and save a canonical training start state with **K**. | 1 |
-| `gui_watch` | Load the trained policy and watch it in a GUI; recording is enabled by default. | 1 |
-| `fast_watch` | Load the trained policy and run headlessly at maximum practical speed; no video or TensorBoard server. | 1 |
-
-### Easiest way: command-line profile
-
-Use `./run.sh` so it sets up `LD_LIBRARY_PATH` automatically and forwards the profile argument:
+The current architecture uses RecurrentPPO from SB3-Contrib. Install it in the project's environment so SB3-Contrib and Stable-Baselines3 are resolved to compatible versions:
 
 ```bash
-# Default fast training: four headless environments
-./run.sh --profile fast_train
-
-# Training with a visible game window
-./run.sh --profile gui_train
-
-# Watch the trained policy in a GUI
-./run.sh --profile gui_watch
-
-# Watch headlessly at maximum speed with one emulator
-./run.sh --profile fast_watch
+.venv/bin/pip install -r requirements-rl.txt
 ```
 
-`--profile NAME` forces that profile's mode/gui/watch/video/TensorBoard defaults for this launch. Alternatively, edit the single line in `.env` and run `./run.sh` without an argument. The `.env` profile applies at startup; explicit settings exported in your shell can override it when you select the profile in `.env`.
+Keep using `./run.sh`; it selects the project's mGBA build and sets `LD_LIBRARY_PATH` as expected by this installation.
 
-### Set up a training start state (recommended)
+## Preserve or recreate the canonical start state
 
-The default curriculum stage is **`clock_set`**: complete the bedroom wall-clock interaction manually, then let PPO learn the remaining introduction, reach Professor Birch, and obtain the starter. This bypasses the clock menu that was blocking the earlier policy without skipping all the way to the main game.
+The environment still requires `runtime_data/states/training_start.state`: Route 101 after the bedroom clock has been set, before Birch's rescue event has been completed, with an empty party. The package does not contain any game or state files.
+
+If you intentionally delete that state, recreate it once using:
 
 ```bash
 ./run.sh --profile setup
 ```
 
-With the default `POKEMON_AI_START_STAGE=clock_set`, finish setting the clock, wait for the menu/dialogue to close so the character is controllable, and press **K** while still in the bedroom (before obtaining the starter). The code verifies Emerald's `FLAG_SET_WALL_CLOCK` story flag and valid player coordinates. It does **not** require a party Pokémon at this stage. Press **Q** or **Esc** to quit setup when the terminal confirms that `runtime_data/states/training_start.state` was saved.
+Use the game controls to reach normal controllable gameplay on Route 101 after setting the clock, but before starting the rescue; press **K** to save and then quit with `q` or `Esc`. The start-state validator checks the map, clock flag, Birch-rescue flag, player coordinates, and party state. It does **not** prescribe a route, coordinates to walk toward, or a scripted route phase to the policy.
 
-Then begin a clean training run:
+## Training
+
+This version changes the observation/policy architecture from feed-forward PPO to recurrent PPO and removes the manually targeted Route 101 coordinate reward. Old `.zip` checkpoints from the earlier policy are not compatible; keep a backup if desired, and remove or rename `emerald_ppo_hybrid_v1.zip` before the first fresh run because `.env` uses `POKEMON_AI_RESUME=0`.
 
 ```bash
 ./run.sh --profile fast_train
 ```
 
-Set `POKEMON_AI_START_STAGE=starter` in `.env` to use the later curriculum stage instead. For that stage, complete the introduction, obtain your starter, reach a normal freely controllable location, then press **K**; validation will require a non-empty party with a valid level. The `clock_set` stage also supports tile-novelty rewards before the starter is obtained, so the agent can receive feedback for exploring its bedroom and finding the route out.
+Default settings are four parallel headless environments, up to 30,000 actions per episode, and 2,000,000 aggregate transitions. Start with this configured budget, inspect the success rate and reward components, and expand training only if the evidence indicates learning is still improving.
 
-Training requires the chosen start state by default and uses it in preference to older per-worker emulator snapshots. If you change the starting stage or state, remember that the existing PPO model checkpoint is not automatically discarded. For a clean first experiment, back up/move `emerald_ppo_checkpoint.zip` and its backup aside before training; otherwise, the app will resume its existing policy. To intentionally allow training without a prepared start state, set `POKEMON_AI_REQUIRE_START_STATE=0`.
+After the first run, a compatible model can be continued by setting `POKEMON_AI_RESUME=1` in `.env`. Do not change the policy architecture or observation schema while resuming a checkpoint.
 
-The setup GUI controls are **arrows/WASD** to move, **Z/Enter** for A, **X/Backspace** for B, **1** for Start, **2** for Select, **K** to save the training-start savestate, **P** to pause, and **Q/Esc** to quit. This is an emulator savestate (`.state`), not the cartridge `.sav`.
+## Reward design
 
-### Optional: edit `.env` instead
+The task-specific directional reward toward a known Route 101 coordinate is intentionally removed. The remaining rewards are retained:
 
-For the normal default, leave this line as:
+| Event | Default reward |
+|---|---:|
+| Every action | −0.00005 |
+| New map, first discovery | +0.75 |
+| New tile, first discovery | +0.02 |
+| New coarse screen state | +0.002, capped at +0.05 per episode |
+| Rescued Birch story flag | +12.0 |
+| Received first Pokémon story flag | +15.0 |
+| Added party member | +5.0 |
+| Level gained | +1.0 per combined party level |
+| New badge | +50.0 |
+| Up to four newly defeated trainer flags per decision | +0.75 each |
+| Starter objective completed | +30.0 |
+| Detected spatially and visually stagnant loop | −0.05 at configured intervals |
 
-```dotenv
-POKEMON_AI_PROFILE=fast_train
-```
+Tile, map, and screen novelty rewards decay as a state is encountered in later episodes, using `base_reward / sqrt(1 + prior_visits)`. This reduces farming the same familiar states after the worker resets. Screen novelty is deliberately tiny and capped so animated pixels and repeated menus cannot dominate task rewards. Story, party, level, badge, trainer, and task-success rewards are event/delta-based and remain in the environment.
 
-Change only the value to `gui_train`, `setup`, `gui_watch`, or `fast_watch`, save the file, and run `./run.sh`. To return to the default, set it back to `fast_train`.
+The per-action cost is small: 1,000 steps cost 0.05 reward, whereas one first-time tile discovery is worth 0.02. Walking is therefore not inherently penalized more than exploration; the small cost makes endlessly repeating actions less attractive. The loop detector requires both nearly static coordinates and nearly static coarse screens, so a menu/dialogue/battle changing while the player stays put is less likely to be punished as a movement loop.
 
-`POKEMON_AI_NUM_ENVS=4` controls the worker count for headless training; try `2`, `4`, or `6` to benchmark your CPU. GUI training and both watch profiles deliberately use one environment, regardless of that setting. Headless watch uses `POKEMON_AI_WATCH_FPS=0` (unlimited frame cap). Fast-forward makes simulation run faster; it does not make the policy reason better per action.
+Reward shaping is a learning signal, not a guarantee of intelligence. Story milestone rewards supply sparse progress feedback; discovery bonuses encourage exploration; recurrent PPO can use information from preceding observations. Training success must still be measured empirically.
 
-## Runtime files and saves
-
-Yes: emulator state files and temporary/intermediate files are kept **outside the project root**, under `runtime_data/`:
-
-- `runtime_data/states/` — shared/worker `.state` savestates, episode-start state files, and atomic state-write temporary files.
-- `runtime_data/tmp/` — temporary model archives, temporary video/WAV/mux files, and diagnostic screenshots.
-
-The `.sav` cartridge save and the `.zip` PPO model checkpoint are separate from emulator state snapshots. Existing root-level legacy state/temp files are migrated at startup when safe; if a destination conflict exists, the old file is preserved under a `legacy_imports/` subfolder rather than overwritten.
-
-## Other settings
-
-| Variable | Default | Purpose |
-|---|---:|---|
-| `POKEMON_AI_VERBOSE` | `1` | Stable-Baselines3 logging: `0` quiet, `1` normal, `2` debug. Use `1` for useful progress. |
-| `POKEMON_AI_MGBA_LOG_LEVEL` | `7` | Native mGBA severity mask (fatal/errors/warnings). Independent of SB3 verbosity. |
-| `POKEMON_AI_FILTER_MGBA_CHATTER` | `1` | Filter routine BIOS SWI/DMA C stdout traces. Set `0` for full native output. |
-| `POKEMON_AI_FILTER_KNOWN_MGBA_WARNINGS` | `1` | Also filter only the repeated DMA source-zero and listed unused video-register messages seen with this setup. Set `0` to inspect them. Other warnings remain visible. |
-| `POKEMON_AI_ACTION_REPEAT` | `2` | Number of GBA frames per selected action. Keep `2` when continuing a checkpoint trained with this action timing. |
-| `POKEMON_AI_MAX_EPISODE_STEPS` | `20000` | Maximum policy actions per episode; set lower for diagnostic runs. |
-| `POKEMON_AI_REQUIRE_START_STATE` | `1` | Refuse training if no canonical savestate for the chosen curriculum stage has been captured. Set `0` only to allow cold-start training. |
-| `POKEMON_AI_START_STAGE` | `clock_set` | Starting curriculum: `clock_set` starts after the bedroom clock is set (no starter required); `starter` requires a valid party and is intended for later navigation/battle training. |
-| `POKEMON_AI_TRAINING_START_STATE` | `runtime_data/states/training_start.state` | Optional absolute or project-relative path to the canonical curriculum-start savestate. |
-| `POKEMON_AI_TOTAL_TIMESTEPS` | `1000000` | Additional PPO training transitions requested in a training call. This is aggregate transitions across vectorized environments. |
-| `POKEMON_AI_CHECKPOINT_EVERY` | `25000` | Transitions between periodic model and emulator-state checkpoints. |
-| `POKEMON_AI_PROGRESS_EVERY` | `1000` | Transitions between console progress summaries. This is not the save interval. |
-| `POKEMON_AI_AUTO_START_TENSORBOARD` | Profile-controlled | Training profiles start TensorBoard; watch profiles don't. An explicitly exported shell value can override when using the `.env` profile. |
-| `POKEMON_AI_TENSORBOARD_PORT` | `6006` | Local TensorBoard port. |
-| `OMP_NUM_THREADS` | `2` | Optional numerical-library thread-pool limit. The best values depend on the workload; benchmark. |
-| `MKL_NUM_THREADS` | `2` | Optional numerical-library thread-pool limit. |
-| `OPENBLAS_NUM_THREADS` | `1` | Optional numerical-library thread-pool limit. |
-| `NUMEXPR_NUM_THREADS` | `1` | Optional numerical-library thread-pool limit. |
-
-For your 6-core Ryzen 5 5600G, begin with four workers, then compare `POKEMON_AI_NUM_ENVS=2`, `4`, and `6` using the reported aggregate transitions/second. More workers can increase memory use or IPC overhead, so more is not automatically faster. To preserve a custom count while choosing a profile, set `POKEMON_AI_NUM_ENVS` in `.env`; the profile does not overwrite this tunable worker-count setting.
-
-## Reward and progress output
-
-Console reward values are **custom reinforcement-learning rewards**, not Pokémon money or an in-game score:
-
-- `step_reward`: reward from the last transition.
-- `mean_reward_1k` / `recent_mean_reward`: recent average reward.
-- `live_episode_reward`: rewards accumulated so far in the current episode.
-- `last_episode_reward`: most recently completed episode return.
-- `tile_reward`: one-time novelty bonus per episode for a new valid player tile, including before the first Pokémon in the `clock_set` stage. A tile cannot be farmed by revisiting it within the same episode; novelty resets when the emulator returns to the canonical episode start.
-- `story_reward`: one-time rewards for selected story flags, including setting the clock and getting the starter/Pokédex.
-- `party_reward`: reward when the party size increases.
-- `badge_reward`: based on official Emerald badge flags read from the dynamically located SaveBlock1.
-
-Reward is only one signal. Map changes, player coordinates, party levels, party growth, story flags, and badge changes are more interpretable game-progress indicators, and increasing reward alone does not prove that the agent is completing the game. Party and badge values are read relative to Emerald's runtime SaveBlock1 pointer, because that save block can move in memory.
-
-A PPO transition is one policy decision/environment step, not one GBA frame. In parallel training, SB3's timestep counter aggregates transitions from all environments.
-
-## Saves and where files are stored
-
-The code keeps runtime-only state and temporary artifacts out of the project root, under `runtime_data/states/` and `runtime_data/tmp/` respectively:
-
-| Path | Purpose |
-|---|---|
-| `emerald_ppo_checkpoint.zip` | PPO model and optimizer checkpoint; kept at root for compatibility with existing runs. |
-| `emerald_ppo_checkpoint.zip.bak` | Previous model archive backup. |
-| `PokemonEmerald.gba` | Your ROM; not included with this project. |
-| `PokemonEmerald.sav` | Persistent **cartridge save**, next to the ROM. In single-instance watch mode, the code creates/attaches it if missing when the mGBA binding supports explicit save-file loading. In training, no shared `.sav` is written because workers must not overwrite one another's save. |
-| `runtime_data/states/emerald_save.state` | Emulator savestate. This resumes the full emulated machine state; it is different from an in-game cartridge save. |
-| `runtime_data/states/emerald_save.worker_N.state` | Separate savestate for each parallel training worker. |
-| `runtime_data/states/training_start.state` | Canonical playable starting point loaded at the beginning of every training episode. |
-| `runtime_data/states/` | Episode-start fallback state files and temporary state-write files. |
-| `runtime_data/tmp/` | Temporary model archives, video intermediates, WAV audio, and mux files. |
-| `videos/` | Final video recordings. |
-| `tensorboard_logs/` | TensorBoard event data. |
-| `logs/run_*.log` | Per-run console logs. |
-| `logs/tensorboard_server.log` | TensorBoard server log. |
-| `logs/session_time_log.txt` | Session duration log. |
-| `.runtime/` | mGBA source/build artifacts created by the setup. |
-| `.venv/` | Python environment. |
-
-### Checkpoint filename and recovery
-
-The final PPO model is `emerald_ppo_checkpoint.zip` in the project root. During a save, the application writes an explicit ZIP file under `runtime_data/tmp/` and only publishes the final file after checking that it is a valid SB3-style ZIP. A normal successful save leaves no temporary model archive behind.
-
-If an older version left a root-level `emerald_ppo_checkpoint.tmp` and the final `.zip` is missing, do not delete the `.tmp` file until it has been checked. Stop the old process gracefully with `Ctrl+C`, then run the recovery check below. It only copies a valid ZIP with an SB3 `data` entry, and never overwrites an existing final checkpoint:
+## Evaluate and watch
 
 ```bash
-python - <<'PY'
-from pathlib import Path
-import shutil, zipfile
-source = Path("emerald_ppo_checkpoint.tmp")
-final = Path("emerald_ppo_checkpoint.zip")
-if not source.is_file():
-    raise SystemExit(f"Not found: {source}")
-if not zipfile.is_zipfile(source):
-    raise SystemExit("The .tmp file is not a ZIP archive; keep it for investigation.")
-with zipfile.ZipFile(source) as zf:
-    names = set(zf.namelist())
-    bad = zf.testzip()
-    if bad is not None or "data" not in names:
-        raise SystemExit(f"Archive validation failed (bad member={bad!r}); kept original.")
-destination = final if not final.exists() else Path("emerald_ppo_checkpoint.recovered.zip")
-if destination.exists():
-    raise SystemExit(f"Refusing to overwrite existing file: {destination}")
-shutil.copy2(source, destination)
-print(f"Recovered validated model archive to: {destination}")
-PY
+./run.sh --profile evaluate
+./run.sh --profile gui_watch
 ```
 
-After recovery, install the corrected `main.py` before starting another training run. The corrected saver passes a path ending in `.zip` to Stable-Baselines3 and verifies the same path, preventing suffix/path mismatches.
-On first launch after this update, old root-level `emerald_save.state`, worker-state files, and `session_time_log.txt` are migrated into the new folders if their destinations don't already exist. Migration copies and verifies before publishing the new file and only removes the old copy after success. If a new destination already exists, the old file is left untouched.
-
-**`.sav` versus `.state`:** a `.sav` stores Pokémon's in-game save data when the game itself saves. A `.state` stores a snapshot of the live emulator, including the exact point in gameplay. Training uses isolated temporary save data and relies on the PPO checkpoint plus per-worker emulator states; it should not write one shared cartridge `.sav` from multiple workers. For normal persistent in-game saves, run watch mode with a single emulator.
-
-## Native mGBA warnings
-
-`GBA Video: Invalid video register: 0x04E` (and `0x056`–`0x05E`) means the emulated game wrote to a video-I/O address mGBA doesn't recognize as a valid register. mGBA's developers note that game-error logs can include questionable things games do even when the game continues to run. The `GBA DMA: Invalid DMA source address: 0x00000000` message means a DMA transfer requested source address zero, which mGBA reports as invalid. If Pokémon Emerald renders and plays normally, these messages alone aren't proof of a fatal problem; investigate if they accompany a black screen, freeze, incorrect gameplay, or crashes. The default optional filter hides only these specific repeated messages to keep the terminal readable. Set `POKEMON_AI_FILTER_KNOWN_MGBA_WARNINGS=0` to show them again. [mGBA issue discussion about invalid video-register game-error messages](https://github.com/mgba-emu/mgba/issues/3578).
-
-## TensorBoard
-
-TensorBoard is a graph dashboard for measurable training metrics, not a transcript of the model's private thoughts. With the default local server, open <http://127.0.0.1:6006> while training and select **Scalars**. It can show episode reward/length, PPO losses, throughput, and custom `progress/*` metrics. A server can be online before the first training event; graphs become useful when training logs are written.
-
-The application-managed server shuts down with the program; logs persist under `tensorboard_logs/`. To inspect prior graphs afterwards, start it manually:
+Evaluation is deterministic by default. To diagnose action diversity during watch only:
 
 ```bash
-source .venv/bin/activate
-tensorboard --logdir tensorboard_logs --host 127.0.0.1 --port 6006
+POKEMON_AI_STOCHASTIC_WATCH=1 ./run.sh --profile gui_watch
 ```
 
-## Controls and shutdown
+Watch mode keeps START and SELECT available and stops after the starter objective; it does not block menu actions. The agent has not been trained on the whole game merely because it can obtain the first Pokémon.
 
-| Input | Action |
-|---|---|
-| `Q` or `Esc` in GUI | Request graceful stop and save/cleanup |
-| `P` in GUI | Pause/resume |
-| `M` in GUI | Mute/unmute live audio |
-| `W/A/S/D` or arrow keys | Movement in watch mode if host controls are enabled in `main.py` |
-| `Z` / `Enter` | A button |
-| `X` / `Backspace` | B button |
-| `1` / `2` | Start / Select |
-| `Ctrl+C` | Graceful stop in GUI or headless mode |
+## Checks
 
-Use a graceful stop rather than `kill -9`. The program attempts to save the PPO model and emulator state on periodic checkpoints and normal shutdown, but no application can guarantee zero lost work after a power failure, OS crash, or forced kill.
+Run these inside the project virtual environment:
 
-## Troubleshooting
+```bash
+.venv/bin/python -m py_compile main.py tests/test_main_logic.py
+.venv/bin/python -m unittest discover -s tests -v
+```
 
-- **mGBA import/shared-library error:** run `./setup.sh` then `./verify_setup.py`; don't mix a Python binding and `libmgba.so` from different builds.
-- **First-frame hang:** use `./run.sh` so the native library path and pre-PyTorch mGBA warm-up are retained.
-- **OpenCV GUI fails on Wayland:** the program selects the bundled XCB plugin if OpenCV's Qt wheel has no Wayland plugin. XWayland and its XCB libraries must still be installed. Try `QT_QPA_PLATFORM=xcb ./run.sh` if necessary.
-- **CPU use looks low:** GUI mode deliberately paces one emulator near 60 FPS. Use headless training with four workers or headless watch with `POKEMON_AI_WATCH_FPS=0` for maximum simulation speed.
-- **RAM grows:** the program uses bounded audio/reward buffers and closes each environment on shutdown, but a long profiling run is needed to rule out native-library leaks. Logs, event files, states and recordings are disk storage, not RAM.
-- **Headless watch has no video:** video is off by default for maximum speed. Set `POKEMON_AI_RECORD_VIDEO=1` when you need a recording; it will add overhead.
-
-Do not redistribute `PokemonEmerald.gba` or original cartridge-save data. Keep generated logs, TensorBoard events, videos and checkpoints out of source control unless you deliberately intend to share them.
+Unit tests exercise reward helpers, state decoding, action mappings, screen signatures, and start-state validation without launching the ROM. A live mGBA smoke test is still needed to validate the exact installed binding and ROM state.

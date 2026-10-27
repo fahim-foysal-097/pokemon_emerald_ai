@@ -16,13 +16,22 @@ import socket
 import threading
 import wave
 import zipfile
-from collections import deque
+import math
+from collections import Counter, deque
 
 
 # Track environment provenance so the selected profile can replace stale mode settings
 # from older .env files while still respecting explicitly exported shell variables.
 _SHELL_ENV_KEYS_AT_START = set(os.environ)
 _PROJECT_ENV_KEYS_LOADED = set()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read a conventional boolean environment variable without surprises."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 def _load_project_env_file():
@@ -97,7 +106,7 @@ _PROFILE_PRESETS = {
         },
     },
     "setup": {
-        "label": "Human-controlled gameplay setup and training-start capture",
+        "label": "Human-controlled gameplay setup, RAM diagnostics and training-start capture",
         "env": {
             "POKEMON_AI_MODE": "setup",
             "POKEMON_AI_GUI_MODE": "1",
@@ -126,6 +135,16 @@ _PROFILE_PRESETS = {
             "POKEMON_AI_AUTO_START_TENSORBOARD": "0",
         },
     },
+    "evaluate": {
+        "label": "Deterministic fixed-start evaluation (five episodes)",
+        "env": {
+            "POKEMON_AI_MODE": "evaluate",
+            "POKEMON_AI_GUI_MODE": "0",
+            "POKEMON_AI_WATCH_FPS": "0",
+            "POKEMON_AI_RECORD_VIDEO": "0",
+            "POKEMON_AI_AUTO_START_TENSORBOARD": "0",
+        },
+    },
 }
 _PROFILE_ALIASES = {
     "default": "fast_train",
@@ -143,6 +162,8 @@ _PROFILE_ALIASES = {
     "watch_headless": "fast_watch",
     "headless_watch": "fast_watch",
     "fast_forward": "fast_watch",
+    "eval": "evaluate",
+    "evaluation": "evaluate",
 }
 
 
@@ -213,11 +234,13 @@ _NATIVE_STDOUT_FILTER_STATE = None
 
 
 def _is_routine_mgba_chatter(line):
-    """Identify noisy mGBA traces and optionally known, non-fatal game-error spam.
+    """Identify routine native traces and narrowly known non-fatal mGBA noise.
 
-    The optional game-warning filter is deliberately narrow: it hides only DMA reads
-    from address zero and the specific unused video-register writes seen with this
-    ROM/build. All other invalid/error/warning messages remain visible.
+    At normal verbosity, the optional known-warning filter also hides low-address
+    BIOS/unmapped-memory diagnostics observed with this ROM/build and routine flash
+    save-data status messages. These are console filters only; they do not change
+    emulation or suppress Python exceptions. Set POKEMON_AI_VERBOSE=2, or disable
+    POKEMON_AI_FILTER_KNOWN_MGBA_WARNINGS, to inspect the known diagnostics.
     """
     stripped = line.lstrip()
     lowered = stripped.lower()
@@ -234,9 +257,67 @@ def _is_routine_mgba_chatter(line):
     filter_known_warnings = os.environ.get(
         "POKEMON_AI_FILTER_KNOWN_MGBA_WARNINGS", "1"
     ).strip().lower() not in {"0", "false", "no", "off"}
-    if filter_known_warnings:
-        if payload.startswith(b"GBA DMA: Invalid DMA source address: 0x00000000"):
+    # mGBA's RTC pak implementation prints one line for every RTC command and
+    # output byte. These are routine emulation traces, not failures, and can flood
+    # normal training logs. Respect the project's SB3 verbosity setting: hide only
+    # these repetitive RTC lines at verbosity 0/1; verbosity 2 keeps them available
+    # for native-emulator debugging. This stdout filter is separate from mGBA's
+    # native severity mask and SB3's own logger.
+    try:
+        sb3_verbosity = int(os.environ.get("POKEMON_AI_VERBOSE", "1"))
+    except (TypeError, ValueError):
+        sb3_verbosity = 1
+    if sb3_verbosity <= 1 and (
+        payload.startswith(b"GBA Pak Hardware: Got RTC command ")
+        or payload.startswith(b"GBA Pak Hardware: RTC output byte ")
+    ):
+        return True
+
+    if filter_known_warnings and sb3_verbosity <= 1:
+        # On this setup, absent/unmapped BIOS-space reads and a few low-address
+        # invalid accesses are emitted repeatedly while the game uses BIOS routines.
+        # Suppress only the known address ranges seen in the logs, leaving unrelated
+        # bad-memory diagnostics available for investigation.
+        bad_bios_prefix = b"GBA Memory: Bad BIOS Load"
+        bad_memory_prefixes = (
+            b"GBA Memory: Bad memory Load",
+            b"GBA Memory: Bad memory Store",
+        )
+        if payload.startswith((bad_bios_prefix,) + bad_memory_prefixes):
+            try:
+                address_token = payload.rsplit(b"0x", 1)[1].split(None, 1)[0].rstrip(b"\r\n")
+                address = int(address_token, 16)
+            except (IndexError, ValueError):
+                address = -1
+
+            if payload.startswith(bad_bios_prefix) and 0 <= address < 0x2000:
+                return True
+            if payload.startswith(bad_memory_prefixes) and (
+                0 <= address < 0x2000 or address == 0xE55EC003
+            ):
+                return True
+
+        # These are routine mGBA flash-save implementation traces, not save failures.
+        routine_savedata_prefixes = (
+            b"GBA Savedata: Performing flash bank switch to bank ",
+            b"GBA Savedata: Performing flash sector erase at ",
+            b"GBA Savedata: Performing unknown sector-size erase at ",
+        )
+        if payload.startswith(routine_savedata_prefixes):
             return True
+
+    if filter_known_warnings:
+        # Emerald/mGBA can repeatedly emit invalid DMA-source diagnostics for
+        # non-zero low addresses too (for example 0x000093AA). These are noisy
+        # native emulator/game traces during ordinary runs. Hide this specific
+        # diagnostic at SB3 verbosity 0/1, but retain it at verbosity 2 so it is
+        # available when deliberately debugging native emulation. The zero-source
+        # variant remains filtered by the existing known-warning rule at all levels.
+        if payload.startswith(b"GBA DMA: Invalid DMA source address: "):
+            if sb3_verbosity <= 1 or payload.startswith(
+                b"GBA DMA: Invalid DMA source address: 0x00000000"
+            ):
+                return True
         known_unused_video_registers = {
             b"0X04E", b"0X056", b"0X058", b"0X05A", b"0X05C", b"0X05E"
         }
@@ -360,9 +441,10 @@ def _install_native_stdout_filter():
 
         atexit.register(restore_stdout_filter)
         print(
-            "[mGBA Console] Filtering routine BIOS/DMA traces; known zero-source DMA and selected unused-video-register "
-            "messages are filtered by POKEMON_AI_FILTER_KNOWN_MGBA_WARNINGS=1. "
-            "Set POKEMON_AI_FILTER_MGBA_CHATTER=0 to show all native stdout.",
+            "[mGBA Console] Filtering routine BIOS/DMA/RTC traces; known low-address BIOS/memory diagnostics "
+            "and routine flash-save status lines are hidden at POKEMON_AI_VERBOSE=0/1 when "
+            "POKEMON_AI_FILTER_KNOWN_MGBA_WARNINGS=1. Use POKEMON_AI_VERBOSE=2 for diagnostics, "
+            "or POKEMON_AI_FILTER_MGBA_CHATTER=0 to show native stdout.",
             flush=True,
         )
         return True
@@ -542,7 +624,15 @@ if __name__ in {"__main__", "__mp_main__"}:
         ) from exc
 
 # These imports load PyTorch. Keep them AFTER the mGBA bootstrap above.
-from stable_baselines3 import PPO
+try:
+    # RecurrentPPO uses an LSTM policy so the agent can use recent observations and
+    # actions to interpret multi-step dialogues, menus, and battles.
+    from sb3_contrib import RecurrentPPO as PPO
+except ImportError as exc:
+    raise ImportError(
+        "This project version uses RecurrentPPO. Install the matching SB3-Contrib package "
+        "inside the project environment with: .venv/bin/pip install sb3-contrib"
+    ) from exc
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
@@ -554,10 +644,12 @@ from stable_baselines3.common.monitor import Monitor
 # ==========================================
 ACTIVE_PROFILE = os.environ.get("POKEMON_AI_PROFILE", "fast_train").strip().lower()
 MODE = os.environ.get("POKEMON_AI_MODE", "train").strip().lower()  # selected by profile
-if MODE not in {"train", "watch", "setup"}:
-    raise ValueError("POKEMON_AI_MODE must be 'train', 'watch', or 'setup'")
+if MODE not in {"train", "watch", "setup", "evaluate"}:
+    raise ValueError("POKEMON_AI_MODE must be 'train', 'watch', 'setup', or 'evaluate'")
 
 # Paths are resolved relative to this script, so the project can be launched from any working directory.
+# Hybrid observations and the 9-action space are intentionally stored under a separate checkpoint
+# name so the older RGB-only policy and its learned weights are never loaded into this architecture.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Runtime-only artifacts stay out of the project root. Keep ROM, its cartridge .sav,
 # and the established PPO model filename at the root for compatibility.
@@ -567,7 +659,13 @@ TEMP_DIR = os.path.join(RUNTIME_DATA_DIR, "tmp")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 ROM_PATH = os.path.join(BASE_DIR, "PokemonEmerald.gba")
 CARTRIDGE_SAVE_PATH = os.path.join(BASE_DIR, "PokemonEmerald.sav")
-MODEL_CHECKPOINT = os.path.join(BASE_DIR, "emerald_ppo_checkpoint")
+# This version uses a Dict observation (screen + structured game state + visited-tile memory)
+# and an action space with WAIT. Keep it separate from the old RGB-only, 8-action checkpoint.
+_MODEL_NAME = os.environ.get("POKEMON_AI_MODEL_NAME", "emerald_ppo_hybrid_v1").strip()
+if not _MODEL_NAME or os.path.basename(_MODEL_NAME) != _MODEL_NAME:
+    raise ValueError("POKEMON_AI_MODEL_NAME must be a simple filename without directory components")
+MODEL_CHECKPOINT = os.path.join(BASE_DIR, _MODEL_NAME)
+RESUME_TRAINING = os.environ.get("POKEMON_AI_RESUME", "1").strip().lower() not in {"0", "false", "no", "off"}
 LEGACY_CHECKPOINT_STATE = os.path.join(BASE_DIR, "emerald_save.state")
 CHECKPOINT_STATE = os.path.join(STATE_DIR, "emerald_save.state")
 _DEFAULT_TRAINING_START_STATE = os.path.join(STATE_DIR, "training_start.state")
@@ -580,12 +678,9 @@ TRAINING_START_STATE = (
 REQUIRE_TRAINING_START_STATE = os.environ.get(
     "POKEMON_AI_REQUIRE_START_STATE", "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
-# Curriculum starting point. clock_set bypasses only the frustrating RTC menu while
-# leaving the route to Professor Birch and obtaining a starter as learnable tasks.
-# Set to "starter" later for a more advanced navigation/battle curriculum.
-TRAINING_START_STAGE = os.environ.get("POKEMON_AI_START_STAGE", "clock_set").strip().lower()
-if TRAINING_START_STAGE not in {"clock_set", "starter"}:
-    raise ValueError("POKEMON_AI_START_STAGE must be 'clock_set' or 'starter'")
+# The only supported learning objective is the original Route 101 task:
+# rescue Professor Birch, choose a starter, and verify the starter is in the party.
+ROUTE_101_MAP_ID = 16  # BPEE mapGroup 0, mapNum 16; verified against the project's RAM telemetry.
 TENSORBOARD_LOG_DIR = os.path.join(BASE_DIR, "tensorboard_logs")
 
 # GUI / headless and mode are selected together by the active profile above.
@@ -610,41 +705,83 @@ HOST_CONTROL_ENABLED = MODE == "setup" or os.environ.get(
 # Action repetition lets each policy decision hold a button for multiple emulator frames.
 # The GUI refreshes each emulated frame; the policy chooses an action every ACTION_REPEAT frames.
 ACTION_REPEAT = int(os.environ.get("POKEMON_AI_ACTION_REPEAT", "2"))
+ACTION_RELEASE_FRAMES = int(os.environ.get("POKEMON_AI_ACTION_RELEASE_FRAMES", "1"))
 if ACTION_REPEAT < 1:
-    raise ValueError("POKEMON_AI_ACTION_REPEAT must be a positive integer")  # Preserve the default two-frame action cadence.
+    raise ValueError("POKEMON_AI_ACTION_REPEAT must be a positive integer")
+if ACTION_RELEASE_FRAMES < 0:
+    raise ValueError("POKEMON_AI_ACTION_RELEASE_FRAMES must be >= 0")
 AUDIO_OUTPUT_ENABLED = True        # Audio plays in single-environment runs; parallel headless training stays silent.
 AUDIO_RATE_MULTIPLIER = 2.0        # Empirical fix: this binding's captured stream sounded correct at 2x.
 AUDIO_QUEUE_CHUNKS = 8             # Bounded queue prevents audio lag from growing without limit.
 # Allow the GBA BIOS/game to produce a real frame on cold start before the first PPO observation.
 INITIAL_BOOT_FRAMES = 600
 RESET_WATCHDOG_SECONDS = 20
-FRAME_DIAGNOSTICS = True
-MAX_EPISODE_STEPS = int(os.environ.get("POKEMON_AI_MAX_EPISODE_STEPS", "20000"))
+FRAME_DIAGNOSTICS = os.environ.get("POKEMON_AI_FRAME_DIAGNOSTICS", "0").strip().lower() not in {"0", "false", "no", "off"}
+SETUP_DIAGNOSTICS_EVERY = int(os.environ.get("POKEMON_AI_SETUP_DIAGNOSTICS_EVERY", "300"))
+if SETUP_DIAGNOSTICS_EVERY < 1:
+    raise ValueError("POKEMON_AI_SETUP_DIAGNOSTICS_EVERY must be a positive integer")
+MAX_EPISODE_STEPS = int(os.environ.get("POKEMON_AI_MAX_EPISODE_STEPS", "30000"))
 if MAX_EPISODE_STEPS < 1:
     raise ValueError("POKEMON_AI_MAX_EPISODE_STEPS must be a positive integer")
-# Keep the per-action cost small enough that a 20k-step episode does not drown out
-# sparse progress rewards. Novelty bonuses are one-time per worker to discourage loops.
-STEP_PENALTY = 0.0001
-LEVEL_REWARD_PER_LEVEL = 2.5
-BADGE_REWARD = 50.0
-NEW_MAP_REWARD = 1.0
-NEW_TILE_REWARD = 0.025
-PARTY_MEMBER_REWARD = 1.5
+EVAL_DIAGNOSTICS_EVERY = int(os.environ.get("POKEMON_AI_EVAL_DIAGNOSTICS_EVERY", "1000"))
+if EVAL_DIAGNOSTICS_EVERY < 1:
+    raise ValueError("POKEMON_AI_EVAL_DIAGNOSTICS_EVERY must be a positive integer")
+# General, non-directional shaping. Existing milestone and progression rewards remain;
+# novelty rewards decay across episodes so revisiting familiar places is less profitable.
+STEP_PENALTY = float(os.environ.get("POKEMON_AI_STEP_PENALTY", "0.00005"))
+LEVEL_REWARD_PER_LEVEL = float(os.environ.get("POKEMON_AI_LEVEL_REWARD", "1.0"))
+BADGE_REWARD = float(os.environ.get("POKEMON_AI_BADGE_REWARD", "50.0"))
+NEW_MAP_REWARD = float(os.environ.get("POKEMON_AI_NEW_MAP_REWARD", "0.75"))
+NEW_TILE_REWARD = float(os.environ.get("POKEMON_AI_NEW_TILE_REWARD", "0.02"))
+NEW_SCREEN_REWARD = float(os.environ.get("POKEMON_AI_NEW_SCREEN_REWARD", "0.002"))
+MAX_SCREEN_NOVELTY_REWARD_PER_EPISODE = float(
+    os.environ.get("POKEMON_AI_SCREEN_NOVELTY_CAP", "0.05")
+)
+PARTY_MEMBER_REWARD = float(os.environ.get("POKEMON_AI_PARTY_MEMBER_REWARD", "5.0"))
+TRAINER_WIN_REWARD = float(os.environ.get("POKEMON_AI_TRAINER_WIN_REWARD", "0.75"))
+LOOP_PENALTY = float(os.environ.get("POKEMON_AI_LOOP_PENALTY", "0.05"))
+LOOP_STAGNATION_STEPS = int(os.environ.get("POKEMON_AI_LOOP_STAGNATION_STEPS", "512"))
+LOOP_PENALTY_INTERVAL = int(os.environ.get("POKEMON_AI_LOOP_PENALTY_INTERVAL", "256"))
+TASK_SUCCESS_REWARD = float(os.environ.get("POKEMON_AI_TASK_SUCCESS_REWARD", "30.0"))
+for _reward_name, _reward_value in {
+    "STEP_PENALTY": STEP_PENALTY,
+    "LEVEL_REWARD_PER_LEVEL": LEVEL_REWARD_PER_LEVEL,
+    "BADGE_REWARD": BADGE_REWARD,
+    "NEW_MAP_REWARD": NEW_MAP_REWARD,
+    "NEW_TILE_REWARD": NEW_TILE_REWARD,
+    "NEW_SCREEN_REWARD": NEW_SCREEN_REWARD,
+    "MAX_SCREEN_NOVELTY_REWARD_PER_EPISODE": MAX_SCREEN_NOVELTY_REWARD_PER_EPISODE,
+    "PARTY_MEMBER_REWARD": PARTY_MEMBER_REWARD,
+    "TRAINER_WIN_REWARD": TRAINER_WIN_REWARD,
+    "LOOP_PENALTY": LOOP_PENALTY,
+    "TASK_SUCCESS_REWARD": TASK_SUCCESS_REWARD,
+}.items():
+    if _reward_value < 0:
+        raise ValueError(f"{_reward_name} must be >= 0")
+if LOOP_STAGNATION_STEPS < 1 or LOOP_PENALTY_INTERVAL < 1:
+    raise ValueError("Loop-detection step settings must be positive integers")
 SAVE_BLOCK1_PTR_ADDRESS = 0x03005D8C
 SAVE_BLOCK1_FLAGS_OFFSET = 0x1270
 SAVE_BLOCK1_POS_X_OFFSET = 0x00
 SAVE_BLOCK1_POS_Y_OFFSET = 0x02
-# FLAG_SET_WALL_CLOCK from the standard Pokémon Emerald BPEE decompilation.
-# This persistent SaveBlock1 flag is used to validate the earlier curriculum start.
+SAVE_BLOCK1_LOCATION_OFFSET = 0x04  # struct WarpData: mapGroup, mapNum, warpId, x, y
+TRAINER_FLAGS_START = 0x500
+TRAINER_FLAGS_END = 0x85F
+STARTER_OBTAINED_FLAG_ID = 0x860
+POKEDEX_OBTAINED_FLAG_ID = 0x861
+OBS_VISITED_GRID_SIZE = 64
+# Story flags used for general, one-time task progress rewards and start-state validation.
+# No route coordinates or route-script phase are fed to the policy as navigation hints.
 CLOCK_SET_FLAG_ID = 0x51
+BIRCH_RESCUED_FLAG_ID = 0x52
 
 # Persistent story flags from the standard Pokémon Emerald (BPEE) decompilation.
 # These are progression milestones, not arbitrary per-frame signals.
 STORY_FLAG_REWARDS = {
     CLOCK_SET_FLAG_ID: 0.5,   # Set the bedroom wall clock
-    0x52: 1.5,   # Rescued Professor Birch
-    0x860: 5.0,  # FLAG_SYS_POKEMON_GET: received the first Pokémon
-    0x861: 2.0,  # FLAG_SYS_POKEDEX_GET: received the Pokédex
+    BIRCH_RESCUED_FLAG_ID: 12.0,  # Rescued Professor Birch: central goal milestone
+    0x860: 15.0, # FLAG_SYS_POKEMON_GET: received the first Pokémon
+    0x861: 3.0,  # FLAG_SYS_POKEDEX_GET: Pokédex obtained
     0x74: 1.5,   # Adventure started / Pokédex obtained
     0x61: 1.0,   # Team Aqua Harbor event
     0x7D: 1.0,   # Rival event on Route 104
@@ -654,24 +791,105 @@ STORY_FLAG_REWARDS = {
     0x75: 2.0,   # Magma event at the Space Center
     0x6F: 2.0,   # Groudon awakened
 }
+# Emerald's persistent visited-town flags (FLAG_VISITED_LITTLEROOT_TOWN through
+# FLAG_VISITED_EVER_GRANDE_CITY, 0x86F..0x87E). Small one-time breadcrumbs help
+# the agent learn forward progression without replacing the larger story objectives.
+for _town_flag in range(0x86F, 0x87F):
+    STORY_FLAG_REWARDS.setdefault(_town_flag, 0.75)
+
+OBS_STORY_FLAG_IDS = tuple(sorted(STORY_FLAG_REWARDS))
+PREVIOUS_ACTION_FEATURE_NAMES = (
+    "previous_action_wait", "previous_action_up", "previous_action_down",
+    "previous_action_left", "previous_action_right", "previous_action_a",
+    "previous_action_b", "previous_action_start", "previous_action_select",
+)
+STATE_FEATURE_NAMES = (
+    "map_group", "map_number", "player_x", "player_y", "party_count",
+    "party_total_levels", "badge_count", "visited_tile_count", "visited_map_count",
+    "trainer_flag_count", "episode_progress", "steps_since_progress", "current_tile_seen",
+    "clock_set", "starter_obtained", "pokedex_obtained",
+) + tuple(f"badge_{i + 1}" for i in range(8)) + tuple(
+    f"story_flag_{flag_id:03X}" for flag_id in OBS_STORY_FLAG_IDS
+) + PREVIOUS_ACTION_FEATURE_NAMES
+
+REWARD_COMPONENT_NAMES = (
+    "step", "tile", "map", "screen", "story", "party", "level", "badge",
+    "trainer", "loop", "task_success",
+)
+
+
+def _episode_time_limit_reached(mode, episode_steps):
+    """Training episodes time out; watch/setup are continuous until user stop."""
+    return str(mode).strip().lower() in {"train", "evaluate"} and int(episode_steps) >= MAX_EPISODE_STEPS
+
+
+def _get_compatible_model_env(model, context):
+    """Return the model's attached (possibly image-transposed) VecEnv after validating it.
+
+    Stable-Baselines3 may wrap an environment in VecTransposeImage when the policy's
+    image observations are channels-last. The wrapped environment, not the original
+    VecEnv passed to PPO.load(), is the one whose observation space matches the policy
+    and whose observations should be passed to model.predict().
+    """
+    model_env = model.get_env()
+    if model_env is None:
+        raise RuntimeError(f"{context}: loaded policy has no attached environment.")
+    if (
+        model.observation_space != model_env.observation_space
+        or model.action_space != model_env.action_space
+    ):
+        raise RuntimeError(
+            f"{context}: policy spaces do not match its attached wrapped environment. "
+            "The checkpoint may have been created with a different observation/action schema."
+        )
+    return model_env
 
 
 def _training_start_validation_error(state):
-    """Return a human-readable reason if a savestate is not valid for the selected curriculum stage."""
+    """Validate the task's starting conditions without prescribing any route or action."""
     if state.get("player_x") is None or state.get("player_y") is None:
-        return "player coordinates are invalid; save while the character is in normal, controllable gameplay"
-
-    if TRAINING_START_STAGE == "clock_set":
-        if CLOCK_SET_FLAG_ID not in state.get("story_flags", set()):
-            return (
-                "the bedroom clock-set flag is not present; finish setting the clock, close the dialogue/menu, "
-                "and press K while the character is controllable"
-            )
-    elif TRAINING_START_STAGE == "starter":
-        if state.get("party_count", 0) < 1 or state.get("party_levels", 0) < 1:
-            return "no valid Pokémon party/level was detected; obtain your starter and press K in free movement"
-
+        return "player coordinates are invalid; save while the character is in normal gameplay"
+    if int(state.get("map_id", -1)) != ROUTE_101_MAP_ID:
+        return (
+            f"the training state must be on Route 101 (map_id={ROUTE_101_MAP_ID}); "
+            f"the current map_id is {state.get('map_id', -1)}"
+        )
+    if CLOCK_SET_FLAG_ID not in state.get("story_flags", set()):
+        return "the bedroom clock-set flag is absent; save after setting the clock"
+    if BIRCH_RESCUED_FLAG_ID in state.get("story_flags", set()):
+        return "the training start must be before rescuing Birch and before receiving a starter"
+    if int(state.get("party_count", 0)) != 0:
+        return "the Route 101 task must start before receiving a starter Pokémon"
+    if int(state.get("party_levels", 0)) != 0:
+        return "the Route 101 task must start with an empty party and no party levels"
     return None
+
+
+def _diminishing_novelty_reward(base_reward, prior_visits):
+    """Decay novelty payoff as the same tile/map/screen is encountered across episodes."""
+    base = max(0.0, float(base_reward))
+    visits = max(0, int(prior_visits))
+    return base / math.sqrt(1.0 + visits)
+
+
+def _screen_signature(screen):
+    """Return a coarse edge-signature of the image for novelty/loop diagnostics.
+
+    It is not a classifier and does not identify menus or locations. Adjacent-pixel
+    contrast detects layout changes in either brightness direction, unlike a one-sided
+    difference hash that can miss a uniformly bright panel on a dark background.
+    """
+    if screen is None:
+        return None
+    frame = np.asarray(screen)
+    if frame.ndim != 3 or frame.shape[2] < 3 or frame.size == 0:
+        return None
+    rgb = np.ascontiguousarray(frame[:, :, :3], dtype=np.uint8)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    small = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA).astype(np.int16)
+    contrast = np.abs(small[:, 1:] - small[:, :-1])
+    bits = (contrast >= 16).reshape(-1)
+    return int.from_bytes(np.packbits(bits).tobytes(), byteorder="big", signed=False)
 
 
 # Auto-Start TensorBoard Server (Training mode only)
@@ -691,7 +909,7 @@ VIDEO_DIR = os.path.join(BASE_DIR, "videos")
 TIMESTAMP_STR = time.strftime("%Y%m%d_%H%M%S")
 TRAIN_VIDEO_PATH = os.path.join(VIDEO_DIR, f"train_journey_{TIMESTAMP_STR}.mp4")
 WATCH_VIDEO_PATH = os.path.join(VIDEO_DIR, f"watch_playback_{TIMESTAMP_STR}.mp4")
-VIDEO_FPS = 60.0 / max(1, ACTION_REPEAT)  # One saved image per decision; keeps recorded playback near real time
+VIDEO_FPS = 60.0 / max(1, ACTION_REPEAT + ACTION_RELEASE_FRAMES)  # One saved image per policy decision
 VIDEO_WIDTH = 240 * 4
 VIDEO_HEIGHT = 160 * 4
 
@@ -701,15 +919,33 @@ ENABLE_NOTIFICATIONS = True if MODE == "watch" else False
 # Environment & Performance Settings
 # Keep these dimensions compatible with an existing checkpoint. The original game image is letterboxed
 # inside this shape so the GBA's 3:2 aspect ratio is not distorted.
-OBS_WIDTH = 80
-OBS_HEIGHT = 72
-TOTAL_TIMESTEPS = int(os.environ.get("POKEMON_AI_TOTAL_TIMESTEPS", "1000000"))
+OBS_WIDTH = 120
+OBS_HEIGHT = 80
+TOTAL_TIMESTEPS = int(os.environ.get("POKEMON_AI_TOTAL_TIMESTEPS", "2000000"))
 if TOTAL_TIMESTEPS < 1:
     raise ValueError("POKEMON_AI_TOTAL_TIMESTEPS must be a positive integer")
+EVAL_EPISODES = int(os.environ.get("POKEMON_AI_EVAL_EPISODES", "5"))
+if EVAL_EPISODES < 1:
+    raise ValueError("POKEMON_AI_EVAL_EPISODES must be a positive integer")
 VERBOSE_LEVEL = int(os.environ.get("POKEMON_AI_VERBOSE", "1"))
 if VERBOSE_LEVEL not in (0, 1, 2):
     raise ValueError("POKEMON_AI_VERBOSE must be 0, 1, or 2")
-STOCHASTIC_WATCH = False         # False = pure deterministic best behavior in watch mode
+STOCHASTIC_WATCH = _env_flag("POKEMON_AI_STOCHASTIC_WATCH", False)
+EVAL_DETERMINISTIC = _env_flag("POKEMON_AI_EVAL_DETERMINISTIC", True)
+PPO_N_STEPS = int(os.environ.get("POKEMON_AI_PPO_N_STEPS", "2048"))
+PPO_BATCH_SIZE = int(os.environ.get("POKEMON_AI_PPO_BATCH_SIZE", "256"))
+PPO_N_EPOCHS = int(os.environ.get("POKEMON_AI_PPO_N_EPOCHS", "10"))
+PPO_GAMMA = float(os.environ.get("POKEMON_AI_PPO_GAMMA", "0.999"))
+PPO_GAE_LAMBDA = float(os.environ.get("POKEMON_AI_PPO_GAE_LAMBDA", "0.98"))
+PPO_LEARNING_RATE = float(os.environ.get("POKEMON_AI_PPO_LEARNING_RATE", "0.0003"))
+ENTROPY_COEF_START = float(os.environ.get("POKEMON_AI_ENTROPY_COEF_START", "0.01"))
+ENTROPY_COEF_END = float(os.environ.get("POKEMON_AI_ENTROPY_COEF_END", "0.001"))
+if min(PPO_N_STEPS, PPO_BATCH_SIZE, PPO_N_EPOCHS) < 1:
+    raise ValueError("PPO n_steps, batch_size, and n_epochs must be positive integers")
+if not 0.0 < PPO_GAMMA <= 1.0 or not 0.0 < PPO_GAE_LAMBDA <= 1.0:
+    raise ValueError("PPO gamma and GAE lambda must be in (0, 1]")
+if min(PPO_LEARNING_RATE, ENTROPY_COEF_START, ENTROPY_COEF_END) < 0:
+    raise ValueError("PPO learning rate and entropy coefficients must be >= 0")
 
 # Environment count for headless training. Override with POKEMON_AI_NUM_ENVS.
 # More workers can increase CPU use, but also require more RAM because every worker owns
@@ -717,7 +953,7 @@ STOCHASTIC_WATCH = False         # False = pure deterministic best behavior in w
 HEADLESS_NUM_ENVS = int(os.environ.get("POKEMON_AI_NUM_ENVS", "4"))
 if HEADLESS_NUM_ENVS < 1:
     raise ValueError("POKEMON_AI_NUM_ENVS must be a positive integer")
-NUM_CPU = 1 if GUI_MODE or MODE == "watch" else HEADLESS_NUM_ENVS
+NUM_CPU = 1 if GUI_MODE or MODE in {"watch", "setup", "evaluate"} else HEADLESS_NUM_ENVS
 VIDEO_OUTPUT_PATH = TRAIN_VIDEO_PATH if MODE == "train" else WATCH_VIDEO_PATH
 # OpenCV records a temporary MPEG-4 Part 2 file. When FFmpeg is available, it is
 # transcoded to broadly compatible H.264/AAC at shutdown and atomically published
@@ -754,8 +990,6 @@ PARTY_POKEMON_SIZE = 100  # sizeof(struct Pokemon) in the runtime SaveBlock1 par
 PARTY_LEVEL_OFFSET = 0x54
 # FLAG_BADGE01_GET through FLAG_BADGE08_GET are 0x867..0x86E in standard Emerald.
 BADGE_FLAG_IDS = tuple(range(0x867, 0x86F))
-MAP_BANK_ADDRESS = 0x020322E4
-MAP_NUMBER_ADDRESS = 0x020322E5
 
 # This is the GBA key index order used by mGBA's documented GBA_KEY constants.
 # setKeys() expects a bitmask, so each key index is converted to 1 << index.
@@ -770,17 +1004,31 @@ GBA_KEY_INDEX = {
     "DOWN": 7,
 }
 ACTION_TO_KEY = {
-    0: "UP",
-    1: "DOWN",
-    2: "LEFT",
-    3: "RIGHT",
-    4: "A",
-    5: "B",
-    6: "START",
-    7: "SELECT",
+    0: "WAIT",  # Explicit no-input action for dialogue animations and menu transitions.
+    1: "UP",
+    2: "DOWN",
+    3: "LEFT",
+    4: "RIGHT",
+    5: "A",
+    6: "B",
+    7: "START",
+    8: "SELECT",
 }
 ACTION_LABELS = dict(ACTION_TO_KEY)
-ACTION_KEY_MASK = {action: 1 << GBA_KEY_INDEX[name] for action, name in ACTION_TO_KEY.items()}
+ACTION_KEY_MASK = {action: (0 if name == "WAIT" else 1 << GBA_KEY_INDEX[name]) for action, name in ACTION_TO_KEY.items()}
+
+
+def _format_action_distribution(action_counts):
+    """Format a deterministic, most-common-first action histogram for diagnostics."""
+    total = sum(int(count) for count in action_counts.values())
+    if total <= 0:
+        return "none"
+    ordered = sorted(action_counts.items(), key=lambda item: (-int(item[1]), int(item[0])))
+    return ", ".join(
+        f"{ACTION_LABELS.get(int(action), f'action_{action}') }={int(count)} ({int(count) / total:.1%})"
+        for action, count in ordered
+        if int(count) > 0
+    )
 
 # mGBA Python bindings expose raw core snapshots, not the frontend saveStateFile API.
 RAW_STATE_MAGIC = b"PYMGBA_RAW_STATE_V1\x00"
@@ -1206,16 +1454,20 @@ class EmeraldEnv(gym.Env):
     def __init__(self, rom_path=ROM_PATH, checkpoint_file=CHECKPOINT_STATE, env_id=0):
         super().__init__()
 
-        self.action_space = spaces.Discrete(8)  # 0:Up, 1:Down, 2:Left, 3:Right, 4:A, 5:B, 6:Start, 7:Select
-        self.observation_space = spaces.Box(
-            low=0, high=255, shape=(OBS_HEIGHT, OBS_WIDTH, 3), dtype=np.uint8
-        )
+        self.action_space = spaces.Discrete(9)  # 0:WAIT, 1..4:directions, 5:A, 6:B, 7:Start, 8:Select
+        self.observation_space = spaces.Dict({
+            "screen": spaces.Box(low=0, high=255, shape=(OBS_HEIGHT, OBS_WIDTH, 3), dtype=np.uint8),
+            # Float mask is flattened by SB3's CombinedExtractor instead of treated as a second image CNN.
+            "visited": spaces.Box(low=0.0, high=1.0, shape=(OBS_VISITED_GRID_SIZE, OBS_VISITED_GRID_SIZE), dtype=np.float32),
+            "state": spaces.Box(low=0.0, high=1.0, shape=(len(STATE_FEATURE_NAMES),), dtype=np.float32),
+        })
 
         self.rom_path = rom_path
         self.checkpoint_file = checkpoint_file
         self.env_id = env_id
         self.step_counter = 0
         self.episode_step_counter = 0
+        self.last_action_id = 0  # Previous discrete action is part of the next observation.
         self.last_notified_event = None
         self.stop_requested = False
         self.paused = False
@@ -1236,7 +1488,20 @@ class EmeraldEnv(gym.Env):
         self._memory_read_warning_printed = False
         self.visited_maps = set()
         self.visited_tiles = set()
+        self.seen_screen_signatures = set()
         self.seen_story_flags = set()
+        self.seen_trainer_flags = set()
+        self.position_history = deque(maxlen=32)
+        self.screen_signature_history = deque(maxlen=32)
+        # Lifetime counts decay novelty across episode resets without rewarding repeats
+        # every frame. They persist per emulator worker for the duration of a run.
+        self.lifetime_tile_visits = Counter()
+        self.lifetime_map_visits = Counter()
+        self.lifetime_screen_visits = Counter()
+        self.episode_screen_novelty_reward = 0.0
+        self.last_novelty_step = 0
+        self.episode_reward_components = {name: 0.0 for name in REWARD_COMPONENT_NAMES}
+        self._last_game_state = None
 
         # Tracking variables for reward shaping deltas
         self.prev_party_levels = 0
@@ -1345,13 +1610,13 @@ class EmeraldEnv(gym.Env):
                 if load_save is not None:
                     # Parallel/training environments must not all write to the same cartridge .sav file.
                     # In watch mode, allow mGBA to persist ordinary in-game saves to the user's .sav file.
-                    temporary_save = MODE == "train" or NUM_CPU > 1
+                    temporary_save = MODE in {"train", "evaluate"} or NUM_CPU > 1
                     try:
                         load_result = load_save(CARTRIDGE_SAVE_PATH, temporary_save)
                         if load_result is False:
                             print(f"[Save Warning] mGBA reported it could not load {CARTRIDGE_SAVE_PATH}.")
                         else:
-                            save_mode = "temporary/read-only during training" if temporary_save else "persistent"
+                            save_mode = "isolated temporary data during training/evaluation" if temporary_save else "persistent"
                             print(f"[Save] Loaded cartridge save ({save_mode}): {CARTRIDGE_SAVE_PATH}")
                     except TypeError:
                         try:
@@ -1366,7 +1631,7 @@ class EmeraldEnv(gym.Env):
                         print(f"[Save Warning] Could not load cartridge save through this binding: {e}")
                 else:
                     autoload_save = _method(self.core, "autoload_save", "autoloadSave")
-                    if autoload_save is not None and not (MODE == "train" and NUM_CPU > 1):
+                    if autoload_save is not None and MODE not in {"train", "evaluate"}:
                         try:
                             print("[Save Warning] This binding lacks loadSaveFile(); trying mGBA's automatic save loading.")
                             autoload_save()
@@ -1416,8 +1681,8 @@ class EmeraldEnv(gym.Env):
                         except Exception as exc:
                             print(f"[Save Warning] Could not autoload default cartridge save: {exc}", flush=True)
                     else:
-                        if MODE == "train":
-                            save_note = "training uses isolated emulator save data and does not write the shared cartridge .sav file"
+                        if MODE in {"train", "evaluate"}:
+                            save_note = "training/evaluation uses isolated emulator save data and does not write the shared cartridge .sav file"
                         else:
                             save_note = "this mGBA binding exposes no persistent save-file loading method"
                         print(
@@ -1589,7 +1854,7 @@ class EmeraldEnv(gym.Env):
                 )
 
             self.window_created = True
-            print("[GUI] Window created. Press Q/Esc to quit, P to pause/resume, M to mute/unmute audio.", flush=True)
+            print("[GUI] Window created. Press q/Esc to quit, P to pause/resume, M to mute/unmute audio.", flush=True)
             if MODE == "watch":
                 if self._mouse_callback_available:
                     print("[GUI] Click the Audio button or press M to mute/unmute.", flush=True)
@@ -1860,11 +2125,11 @@ class EmeraldEnv(gym.Env):
             "or supported direct screenshot API is available."
         )
 
-    def _get_obs(self):
+    def _get_image_obs(self):
+        """Return the resized RGB screen while retaining the native-sized frame for GUI/video."""
         raw_frame_rgb = self._read_framebuffer()
         self._last_raw_frame_rgb = raw_frame_rgb
 
-        # Save a small, fixed set of real application frames so video-path regressions are easy to inspect.
         if FRAME_DIAGNOSTICS and self.step_counter in (0, 1, 30, 120, 600):
             os.makedirs(TEMP_DIR, exist_ok=True)
             debug_path = os.path.join(
@@ -1882,7 +2147,6 @@ class EmeraldEnv(gym.Env):
             except Exception as exc:
                 print(f"[Video Debug Warning] Could not save diagnostic frame: {exc}", flush=True)
 
-        # Keep the original observation shape for existing CNN checkpoints.
         raw_height, raw_width = raw_frame_rgb.shape[:2]
         if raw_width <= 0 or raw_height <= 0:
             raise RuntimeError(f"mGBA returned an invalid frame shape: {raw_frame_rgb.shape}")
@@ -1892,11 +2156,87 @@ class EmeraldEnv(gym.Env):
         resized = cv2.resize(
             raw_frame_rgb, (scaled_width, scaled_height), interpolation=cv2.INTER_NEAREST
         )
-        obs = np.zeros((OBS_HEIGHT, OBS_WIDTH, 3), dtype=np.uint8)
+        screen = np.zeros((OBS_HEIGHT, OBS_WIDTH, 3), dtype=np.uint8)
         x_offset = (OBS_WIDTH - scaled_width) // 2
         y_offset = (OBS_HEIGHT - scaled_height) // 2
-        obs[y_offset:y_offset + scaled_height, x_offset:x_offset + scaled_width] = resized
-        return obs
+        screen[y_offset:y_offset + scaled_height, x_offset:x_offset + scaled_width] = resized
+        return screen
+
+    def _encode_state_features(self, state):
+        """Encode validated game state as bounded float features for the policy."""
+        state = state or {}
+        story_flags = state.get("story_flags", set())
+        badge_flags = int(state.get("badge_flags", 0) or 0)
+        x = state.get("player_x")
+        y = state.get("player_y")
+        map_id = int(state.get("map_id", -1) if state.get("map_id") is not None else -1)
+        current_tile_seen = 0.0
+        if x is not None and y is not None and map_id >= 0:
+            current_tile_seen = float((map_id, int(x), int(y)) in self.visited_tiles)
+
+        values = [
+            max(0.0, min(1.0, float(state.get("map_group", 0)) / 31.0)),
+            max(0.0, min(1.0, float(state.get("map_number", 0)) / 100.0)),
+            max(0.0, min(1.0, float(x or 0) / 512.0)),
+            max(0.0, min(1.0, float(y or 0) / 512.0)),
+            max(0.0, min(1.0, float(state.get("party_count", 0)) / 6.0)),
+            max(0.0, min(1.0, float(state.get("party_levels", 0)) / 600.0)),
+            max(0.0, min(1.0, float(badge_flags.bit_count()) / 8.0)),
+            max(0.0, min(1.0, len(self.visited_tiles) / 1024.0)),
+            max(0.0, min(1.0, len(self.visited_maps) / 64.0)),
+            max(0.0, min(1.0, len(state.get("trainer_flags", set())) / 864.0)),
+            max(0.0, min(1.0, self.episode_step_counter / float(max(1, MAX_EPISODE_STEPS)))),
+            max(0.0, min(1.0, (self.episode_step_counter - getattr(self, "last_novelty_step", 0)) / float(max(1, LOOP_STAGNATION_STEPS)))),
+            current_tile_seen,
+            float(CLOCK_SET_FLAG_ID in story_flags),
+            float(STARTER_OBTAINED_FLAG_ID in story_flags or state.get("party_count", 0) > 0),
+            float(POKEDEX_OBTAINED_FLAG_ID in story_flags),
+        ]
+        values.extend(float(bool(badge_flags & (1 << i))) for i in range(8))
+        values.extend(float(flag_id in story_flags) for flag_id in OBS_STORY_FLAG_IDS)
+        previous_action = int(getattr(self, "last_action_id", 0))
+        values.extend(float(previous_action == action_id) for action_id in range(9))
+        result = np.asarray(values, dtype=np.float32)
+        if result.shape != (len(STATE_FEATURE_NAMES),):
+            raise RuntimeError(
+                f"State feature vector has shape {result.shape}, expected {(len(STATE_FEATURE_NAMES),)}"
+            )
+        return np.clip(result, 0.0, 1.0)
+
+    def _visited_mask(self, map_id):
+        """Local map-grid memory; only positions from the current map are included."""
+        mask = np.zeros((OBS_VISITED_GRID_SIZE, OBS_VISITED_GRID_SIZE), dtype=np.float32)
+        if map_id is None or int(map_id) < 0:
+            return mask
+        # The observation memory is intentionally coarse. Emerald's map coordinates can
+        # exceed 63; compress them into the fixed 64x64 mask instead of silently dropping
+        # every visited tile outside the upper-left 64x64 region. Exact tile novelty still
+        # uses the original (map_id, x, y) tuple, so this affects observation only.
+        for visited_map, x, y in self.visited_tiles:
+            if visited_map != int(map_id) or int(x) < 0 or int(y) < 0:
+                continue
+            gx = min(OBS_VISITED_GRID_SIZE - 1, int(x) * OBS_VISITED_GRID_SIZE // 128)
+            gy = min(OBS_VISITED_GRID_SIZE - 1, int(y) * OBS_VISITED_GRID_SIZE // 128)
+            mask[gy, gx] = 1.0
+        return mask
+
+    def _get_obs(self, game_state=None, read_state=True, screen=None):
+        """Hybrid observation. Screens are captured in headless and GUI modes alike."""
+        if screen is None:
+            screen = self._get_image_obs()
+        state = game_state
+        if state is None and read_state:
+            try:
+                state = self._read_game_state()
+            except Exception:
+                state = {}
+        state = state or {}
+        map_id = state.get("map_id", -1)
+        return {
+            "screen": screen,
+            "visited": self._visited_mask(map_id),
+            "state": self._encode_state_features(state),
+        }
 
     def _set_action_keys(self, action):
         """Set GBA input using the native bitmask API or mGBA's Python raw= keyword."""
@@ -1906,9 +2246,11 @@ class EmeraldEnv(gym.Env):
         else:
             action = int(action)
             if action not in ACTION_TO_KEY:
-                raise ValueError(f"Invalid action {action}; expected an integer from 0 to 7.")
+                raise ValueError(f"Invalid action {action}; expected an integer from 0 to 8.")
             key_name = ACTION_TO_KEY[action]
             mask = ACTION_KEY_MASK[action]
+            if key_name == "WAIT":
+                key_name = None
 
         set_keys_camel = _method(self.core, "setKeys")
         if set_keys_camel is not None:
@@ -2003,6 +2345,23 @@ class EmeraldEnv(gym.Env):
                 mask |= 1 << badge_index
         return mask
 
+    def _read_trainer_flags(self, saveblock1_ptr):
+        """Read the set trainer-defeated flags (0x500..0x85F) efficiently by byte."""
+        flags_base = saveblock1_ptr + SAVE_BLOCK1_FLAGS_OFFSET
+        start_byte = TRAINER_FLAGS_START >> 3
+        end_byte = TRAINER_FLAGS_END >> 3
+        found = set()
+        for byte_index in range(start_byte, end_byte + 1):
+            value = self._read8(flags_base + byte_index)
+            if not value:
+                continue
+            first_flag = byte_index * 8
+            for bit in range(8):
+                flag_id = first_flag + bit
+                if TRAINER_FLAGS_START <= flag_id <= TRAINER_FLAGS_END and value & (1 << bit):
+                    found.add(flag_id)
+        return found
+
     def _read_game_state(self):
         """Read party, badges, map, coordinates and story flags for Emerald BPEE."""
         saveblock1_ptr = self._read_saveblock1_pointer()
@@ -2025,20 +2384,34 @@ class EmeraldEnv(gym.Env):
                 total_party_levels += level
 
         badge_flags = self._read_badge_flags(saveblock1_ptr)
-        map_bank = self._read8(MAP_BANK_ADDRESS)
-        map_number = self._read8(MAP_NUMBER_ADDRESS)
-        map_id = (map_bank << 8) | map_number
+        # SaveBlock1.location is a WarpData at offset 0x04; mapGroup/mapNum are signed bytes.
+        map_group = self._read8(saveblock1_ptr + SAVE_BLOCK1_LOCATION_OFFSET)
+        map_number = self._read8(saveblock1_ptr + SAVE_BLOCK1_LOCATION_OFFSET + 1)
+        if map_group >= 0x80:
+            map_group -= 0x100
+        if map_number >= 0x80:
+            map_number -= 0x100
+        # Map group/number are signed bytes in WarpData. Keep the full nonnegative
+        # signed-byte range rather than hardcoding an assumed number of map groups.
+        if 0 <= map_group <= 127 and 0 <= map_number <= 127:
+            map_id = (map_group << 8) | map_number
+        else:
+            map_id = -1
         player_x, player_y = self._read_player_position(saveblock1_ptr)
         story_flags = self._read_story_flags(saveblock1_ptr)
-
+        trainer_flags = self._read_trainer_flags(saveblock1_ptr)
         return {
             "party_count": party_count,
             "party_levels": total_party_levels,
             "badge_flags": badge_flags,
+            "badge_count": badge_flags.bit_count(),
             "map_id": map_id,
+            "map_group": map_group,
+            "map_number": map_number,
             "player_x": player_x,
             "player_y": player_y,
             "story_flags": story_flags,
+            "trainer_flags": trainer_flags,
         }
 
     def _refresh_reward_baseline(self):
@@ -2048,10 +2421,24 @@ class EmeraldEnv(gym.Env):
             self.prev_badges = state["badge_flags"]
             self.prev_caught_count = state["party_count"]
             self.prev_map_id = state["map_id"]
-            self.visited_maps.add(state["map_id"])
+            if state["map_id"] >= 0:
+                map_id = int(state["map_id"])
+                self.visited_maps.add(map_id)
+                self.lifetime_map_visits[map_id] += 1
             self.seen_story_flags.update(state.get("story_flags", set()))
-            if state.get("player_x") is not None and state.get("player_y") is not None:
-                self.visited_tiles.add((state["map_id"], state["player_x"], state["player_y"]))
+            self.seen_trainer_flags.update(state.get("trainer_flags", set()))
+            if state["map_id"] >= 0 and state.get("player_x") is not None and state.get("player_y") is not None:
+                position = (int(state["map_id"]), int(state["player_x"]), int(state["player_y"]))
+                self.visited_tiles.add(position)
+                self.lifetime_tile_visits[position] += 1
+                self.position_history.append(position)
+            screen_signature = _screen_signature(self._get_image_obs())
+            if screen_signature is not None:
+                self.seen_screen_signatures.add(screen_signature)
+                self.screen_signature_history.append(screen_signature)
+                self.lifetime_screen_visits[screen_signature] += 1
+            self.last_novelty_step = self.episode_step_counter
+            self._last_game_state = state
             self._memory_read_warning_printed = False
         except Exception as e:
             if not self._memory_read_warning_printed:
@@ -2069,6 +2456,17 @@ class EmeraldEnv(gym.Env):
                 self.audio_output.clear_pending()
             print(f"[Reset {self.env_id}] entered", flush=True)
             super().reset(seed=seed)
+            self.visited_maps.clear()
+            self.visited_tiles.clear()
+            self.seen_screen_signatures.clear()
+            self.seen_story_flags.clear()
+            self.seen_trainer_flags.clear()
+            self.position_history.clear()
+            self.screen_signature_history.clear()
+            self.episode_screen_novelty_reward = 0.0
+            self.last_novelty_step = 0
+            self.episode_reward_components = {name: 0.0 for name in REWARD_COMPONENT_NAMES}
+            self._last_game_state = None
 
             if self.stop_requested or STOP_REQUESTED:
                 obs = self._get_obs()
@@ -2086,12 +2484,12 @@ class EmeraldEnv(gym.Env):
                     if not restored_checkpoint:
                         raise RuntimeError(
                             f"Training start savestate exists but could not be loaded: {TRAINING_START_STATE}. "
-                            "Recreate it with --profile setup and press K in a playable state."
+                            "Recreate it with ./run.sh --profile setup and press K on Route 101 before obtaining a starter."
                         )
-                elif MODE == "train" and REQUIRE_TRAINING_START_STATE:
+                elif MODE in {"train", "evaluate", "watch"} and REQUIRE_TRAINING_START_STATE:
                     raise FileNotFoundError(
                         f"Required training start savestate not found: {TRAINING_START_STATE}\n"
-                        f"Run ./run.sh --profile setup and follow the instructions for stage '{TRAINING_START_STAGE}', "
+                        f"Run ./run.sh --profile setup and follow the instructions for Route 101 task, "
                         "then press K to save the training start state."
                     )
                 elif MODE != "setup" and os.path.isfile(self.checkpoint_file):
@@ -2103,8 +2501,8 @@ class EmeraldEnv(gym.Env):
                 if restored_checkpoint:
                     print("[Reset] Checkpoint restored; refreshing one frame.", flush=True)
                     self._advance_frame_for_observation(1)
-                    if MODE in {"train", "watch"} and os.path.isfile(TRAINING_START_STATE):
-                        # Validate that the canonical savestate matches the chosen curriculum stage.
+                    if MODE in {"train", "watch", "evaluate"} and os.path.isfile(TRAINING_START_STATE):
+                        # Validate the canonical Route 101 pre-starter state.
                         try:
                             start_state = self._read_game_state()
                         except Exception as exc:
@@ -2115,11 +2513,11 @@ class EmeraldEnv(gym.Env):
                         validation_error = _training_start_validation_error(start_state)
                         if validation_error:
                             raise RuntimeError(
-                                f"Training start state does not satisfy stage '{TRAINING_START_STAGE}': "
-                                f"{validation_error}. Recreate it with ./run.sh --profile setup and press K."
+                                f"Training start state is invalid: {validation_error}. "
+                                "Recreate it with ./run.sh --profile setup and press K."
                             )
                         print(
-                            f"[Start State] Validated stage={TRAINING_START_STAGE} | "
+                            f"[Start State] Validated Route 101 task | "
                             f"party_count={start_state['party_count']} | map_id={start_state['map_id']} | "
                             f"player=({start_state['player_x']},{start_state['player_y']})",
                             flush=True,
@@ -2138,8 +2536,8 @@ class EmeraldEnv(gym.Env):
                 print(f"[Reset {self.env_id}] building initial observation", flush=True)
                 obs = self._get_obs()
                 print(
-                    f"[Reset {self.env_id}] observation ready: {obs.shape}, dtype={obs.dtype}, "
-                    f"range={int(obs.min())}..{int(obs.max())}",
+                    f"[Reset {self.env_id}] observation ready: screen={obs['screen'].shape}, "
+                    f"state={obs['state'].shape}, visited={obs['visited'].shape}",
                     flush=True,
                 )
                 # Show the game before native snapshot or RAM-reward operations, so a later stall
@@ -2161,14 +2559,11 @@ class EmeraldEnv(gym.Env):
                 if GUI_MODE:
                     self._render_gui(time.perf_counter())
 
-            # Episodes restore the same canonical start state. Novelty/story bookkeeping
-            # must therefore be episode-local: the same valid route should earn its
-            # feedback again in a new episode, while loops inside one episode cannot farm it.
-            self.visited_maps.clear()
-            self.visited_tiles.clear()
-            self.seen_story_flags.clear()
+            # The canonical start is restored on train episode resets. Novelty and reward
+            # component trackers are episode-local; seed them with the current start tile/flags.
             print(f"[Reset {self.env_id}] refreshing reward baseline", flush=True)
             self._refresh_reward_baseline()
+            obs = self._get_obs(game_state=self._last_game_state, read_state=False)
             print(
                 f"[Reset {self.env_id}] complete in {time.perf_counter() - reset_started:.2f}s",
                 flush=True,
@@ -2189,7 +2584,11 @@ class EmeraldEnv(gym.Env):
     def step(self, action):
         if self.stop_requested or STOP_REQUESTED:
             self.stop_requested = True
-            return self._get_obs(), 0.0, False, True, {"stopped": True}
+            return self._get_obs(), 0.0, False, True, {
+                "stopped": True,
+                "episode_outcome": "STOPPED",
+                "TimeLimit.truncated": True,
+            }
 
         self.step_counter += 1
         self.episode_step_counter += 1
@@ -2201,33 +2600,40 @@ class EmeraldEnv(gym.Env):
             elif MODE == "setup":
                 action = None  # neutral input until a human presses a control key
 
+        try:
+            self.last_action_id = int(np.asarray(action).reshape(-1)[0]) if action is not None else 0
+            if not 0 <= self.last_action_id <= 8:
+                self.last_action_id = 0
+        except (TypeError, ValueError, IndexError, OverflowError):
+            self.last_action_id = 0
+
         if self.core is not None:
             run_frame = _method(self.core, "run_frame", "runFrame")
             if run_frame is None:
                 raise RuntimeError("The installed mGBA core does not expose runFrame() or run_frame().")
 
-            for _ in range(max(1, ACTION_REPEAT)):
-                self._set_action_keys(action)
-                frame_started = time.perf_counter()
-                run_frame()
-                self._pump_audio_buffer(
-                    accept=self._audio_accepting,
-                    record=self._record_audio_active,
-                )
-
-                # Refresh the window for each emulated frame (60 Hz) while the PPO policy
-                # still chooses an action every ACTION_REPEAT frames.
-                if GUI_MODE:
-                    self._last_raw_frame_rgb = self._read_framebuffer()
-                    self._render_gui(frame_started)
-                    if self.stop_requested or STOP_REQUESTED:
-                        break
-                elif MODE == "watch" and WATCH_FPS_CAP > 0:
-                    # Optional headless frame cap; zero means fastest possible emulation.
-                    delay = (1.0 / WATCH_FPS_CAP) - (time.perf_counter() - frame_started)
-                    if delay > 0:
-                        time.sleep(delay)
-            # Release keys after the action so button taps can be recognized by the game.
+            # Insert at least one neutral emulated frame between button presses. Merely
+            # calling setKeys(0) without advancing a frame doesn't reliably create a release edge.
+            for frame_action, frame_count in ((action, max(1, ACTION_REPEAT)), (None, ACTION_RELEASE_FRAMES)):
+                for _ in range(frame_count):
+                    self._set_action_keys(frame_action)
+                    frame_started = time.perf_counter()
+                    run_frame()
+                    self._pump_audio_buffer(
+                        accept=self._audio_accepting,
+                        record=self._record_audio_active,
+                    )
+                    if GUI_MODE:
+                        self._last_raw_frame_rgb = self._read_framebuffer()
+                        self._render_gui(frame_started)
+                        if self.stop_requested or STOP_REQUESTED:
+                            break
+                    elif MODE == "watch" and WATCH_FPS_CAP > 0:
+                        delay = (1.0 / WATCH_FPS_CAP) - (time.perf_counter() - frame_started)
+                        if delay > 0:
+                            time.sleep(delay)
+                if self.stop_requested or STOP_REQUESTED:
+                    break
             self._set_action_keys(None)
 
         # Save after releasing the previous action's key, avoiding a snapshot with a held key.
@@ -2238,22 +2644,21 @@ class EmeraldEnv(gym.Env):
                 validation_error = _training_start_validation_error(setup_state)
                 if validation_error:
                     print(
-                        f"[Setup] Not saved for stage '{TRAINING_START_STAGE}': {validation_error}.",
+                        f"[Setup] Not saved: {validation_error}.",
                         flush=True,
                     )
                 elif self._save_state_file(TRAINING_START_STATE):
                     print(
-                        f"[Setup] Training start savestate saved for stage '{TRAINING_START_STAGE}': "
-                        f"{TRAINING_START_STATE}",
+                        f"[Setup] Route 101 training start savestate saved: {TRAINING_START_STATE}",
                         flush=True,
                     )
-                    if TRAINING_START_STAGE == "clock_set":
-                        print(
-                            "[Setup] This stage intentionally starts before the first Pokémon; tile exploration "
-                            "rewards are active before obtaining a starter.", flush=True
-                        )
                     print(
-                        "[Setup] For a clean experiment, back up/move emerald_ppo_checkpoint.zip, "
+                        "[Setup] This task starts with the clock set and an empty party, before obtaining the first Pokémon.",
+                        flush=True,
+                    )
+                    print(
+                        f"[Setup] Active PPO checkpoint path is {MODEL_CHECKPOINT}.zip. "
+                        "Preserve any existing checkpoint before starting a new incompatible experiment; "
                         "then run ./run.sh --profile fast_train.", flush=True
                     )
                 else:
@@ -2261,23 +2666,26 @@ class EmeraldEnv(gym.Env):
             except Exception as exc:
                 print(f"[Setup] Not saved because the game state could not be validated: {exc}", flush=True)
 
-        obs = self._get_obs()
-
-        # --- Comprehensive Dense Reward Shaping (US v1.0 BPEE RAM Mapping) ---
-        # Rewards are based on changes from the preceding step; the step penalty is constant, not cumulative.
-        reward = -STEP_PENALTY
+        # Read one screenshot for both generic visual novelty and the policy observation.
+        # This path runs even in headless mode; GUI_MODE only controls displaying the frame.
+        screen_frame = self._get_image_obs() if self.core is not None else None
+        current_screen_signature = _screen_signature(screen_frame)
+        state = None
+        component = {name: 0.0 for name in REWARD_COMPONENT_NAMES}
+        component["step"] = -STEP_PENALTY
         info = {"episode_step": self.episode_step_counter}
+        terminated = False
+        if current_screen_signature is not None:
+            self.screen_signature_history.append(current_screen_signature)
         if self.core is not None:
             try:
                 state = self._read_game_state()
+                self._last_game_state = state
 
-                # 1. Small per-decision cost; it should not swamp progress over 20k actions.
-                neg_steps_reward = -STEP_PENALTY
-
-                # 2. Reward increases in combined party level, never decreases.
+                # Level/party progress is delta-based and cannot be farmed by standing still.
                 previous_party_levels = self.prev_party_levels
                 level_delta = state["party_levels"] - previous_party_levels
-                level_reward = max(0, level_delta) * LEVEL_REWARD_PER_LEVEL
+                component["level"] = max(0, level_delta) * LEVEL_REWARD_PER_LEVEL
                 if MODE == "watch" and state["party_levels"] // 10 > previous_party_levels // 10:
                     send_notification(
                         "Pokémon Training Milestone",
@@ -2285,89 +2693,169 @@ class EmeraldEnv(gym.Env):
                     )
                 self.prev_party_levels = state["party_levels"]
 
-                # Badge bits come from the official persistent FLAG_BADGE01_GET..08_GET flags.
                 new_badge_bits = state["badge_flags"] & (~self.prev_badges & 0xFF)
                 new_badges = int(new_badge_bits).bit_count()
-                badge_reward = BADGE_REWARD * new_badges
+                component["badge"] = BADGE_REWARD * new_badges
                 self.prev_badges = state["badge_flags"]
 
-                # 3. One-time reward for discovering a map.
-                map_id = state["map_id"]
-                new_area_discovered = map_id not in self.visited_maps
-                exploration_reward = NEW_MAP_REWARD if new_area_discovered else 0.0
-                if new_area_discovered:
-                    self.visited_maps.add(map_id)
-                    if MODE == "watch":
-                        send_notification("New Pokémon Emerald Area", f"The AI discovered map ID {map_id}.")
-                self.prev_map_id = map_id
+                map_id = int(state["map_id"])
+                new_area_discovered = False
+                if map_id >= 0:
+                    new_area_discovered = map_id not in self.visited_maps
+                    if new_area_discovered:
+                        self.visited_maps.add(map_id)
+                        prior_visits = self.lifetime_map_visits[map_id]
+                        component["map"] = _diminishing_novelty_reward(NEW_MAP_REWARD, prior_visits)
+                        self.lifetime_map_visits[map_id] += 1
+                        if MODE == "watch":
+                            send_notification("New Pokémon Emerald Area", f"The AI discovered map ID {map_id}.")
 
-                # 4. One-time tile novelty is enabled even before the first Pokémon. That is
-                # essential for the clock_set curriculum, where reaching the starter is the task.
-                # Skip invalid positions rather than rewarding garbage RAM values.
                 player_x = state.get("player_x")
                 player_y = state.get("player_y")
-                tile_reward = 0.0
                 new_tile_discovered = False
-                if player_x is not None and player_y is not None:
+                if map_id >= 0 and player_x is not None and player_y is not None:
                     tile_key = (map_id, int(player_x), int(player_y))
                     if tile_key not in self.visited_tiles:
                         self.visited_tiles.add(tile_key)
-                        tile_reward = NEW_TILE_REWARD
+                        prior_visits = self.lifetime_tile_visits[tile_key]
+                        component["tile"] = _diminishing_novelty_reward(NEW_TILE_REWARD, prior_visits)
+                        self.lifetime_tile_visits[tile_key] += 1
                         new_tile_discovered = True
+                    self.position_history.append(tile_key)
 
-                # 5. Reward curated permanent story flags on the first transition only.
+                # Reward broad visual-state novelty at a low rate. It is capped per episode
+                # and decays across resets so animated pixels/menus cannot dominate progress.
+                new_screen_discovered = False
+                if current_screen_signature is not None and current_screen_signature not in self.seen_screen_signatures:
+                    self.seen_screen_signatures.add(current_screen_signature)
+                    prior_screen_visits = self.lifetime_screen_visits[current_screen_signature]
+                    potential_screen_reward = _diminishing_novelty_reward(NEW_SCREEN_REWARD, prior_screen_visits)
+                    remaining_screen_budget = max(
+                        0.0,
+                        MAX_SCREEN_NOVELTY_REWARD_PER_EPISODE - self.episode_screen_novelty_reward,
+                    )
+                    component["screen"] = min(potential_screen_reward, remaining_screen_budget)
+                    self.episode_screen_novelty_reward += component["screen"]
+                    self.lifetime_screen_visits[current_screen_signature] += 1
+                    new_screen_discovered = component["screen"] > 0.0
+
+                # Story flag bonuses are unique within an episode; reward transitions, not
+                # the absolute value of a cumulative story score.
                 current_story_flags = state.get("story_flags", set())
                 new_story_flags = current_story_flags - self.seen_story_flags
-                story_reward = sum(STORY_FLAG_REWARDS.get(flag, 0.0) for flag in new_story_flags)
+                component["story"] = sum(STORY_FLAG_REWARDS.get(flag, 0.0) for flag in new_story_flags)
                 self.seen_story_flags.update(current_story_flags)
 
-                # Party expansion is a useful intermediate milestone (receiving/catching Pokémon).
                 party_members_added = max(0, state["party_count"] - self.prev_caught_count)
-                party_reward = PARTY_MEMBER_REWARD * party_members_added
-                if party_members_added:
-                    self.last_notified_event = "party_growth"
-                    if MODE == "watch":
-                        send_notification(
-                            "🎉 Pokémon Party Expanded",
-                            f"Party size increased by {party_members_added}.",
-                        )
+                component["party"] = PARTY_MEMBER_REWARD * party_members_added
+                if party_members_added and MODE == "watch":
+                    send_notification("Pokémon Party Expanded", f"Party size increased by {party_members_added}.")
                 self.prev_caught_count = state["party_count"]
+
+                # Trainer flags are a reliable, one-time proxy for trainer victories in Emerald.
+                current_trainer_flags = state.get("trainer_flags", set())
+                new_trainer_flags = current_trainer_flags - self.seen_trainer_flags
+                component["trainer"] = min(4, len(new_trainer_flags)) * TRAINER_WIN_REWARD
+                self.seen_trainer_flags.update(current_trainer_flags)
 
                 if new_badges:
                     self.last_notified_event = "gym_badge"
-                    send_notification("🏆 Gym Victory Milestone!", f"The AI appears to have acquired {new_badges} new badge(s).")
+                    if MODE == "watch":
+                        send_notification("Gym Victory Milestone", f"The AI appears to have acquired {new_badges} new badge(s).")
 
-                # Aggregate reward components. Novelty/story sets are episode-local, so each
-                # restarted episode can learn a route again, but loops cannot repeatedly reward
-                # the same tile/flag within a single episode.
-                reward = (
-                    neg_steps_reward + level_reward + badge_reward + exploration_reward
-                    + tile_reward + story_reward + party_reward
+                # Small periodic anti-stagnation penalty; don't punish ordinary backtracking
+                # or every step. Novelty/progression resets the stagnation timer.
+                novelty_event = bool(
+                    new_tile_discovered or new_area_discovered or new_screen_discovered or new_story_flags or
+                    party_members_added or level_delta > 0 or new_badges or new_trainer_flags
                 )
+                if novelty_event:
+                    self.last_novelty_step = self.episode_step_counter
+                elif (
+                    map_id >= 0
+                    and self.episode_step_counter - self.last_novelty_step >= LOOP_STAGNATION_STEPS
+                    and self.episode_step_counter % LOOP_PENALTY_INTERVAL == 0
+                ):
+                    recent_unique_positions = len(set(self.position_history))
+                    recent_unique_screens = len(set(self.screen_signature_history))
+                    # A repeated position alone is insufficient: dialogue/battle/menu screens
+                    # may advance while coordinates remain fixed. Penalize only a spatially
+                    # and visually static loop after the grace period.
+                    if (
+                        len(self.position_history) >= 16
+                        and recent_unique_positions <= 4
+                        and len(self.screen_signature_history) >= 16
+                        and recent_unique_screens <= 2
+                    ):
+                        component["loop"] = -LOOP_PENALTY
+
+                # The only goal is to obtain the first Pokémon from the Route 101 start.
+                task_success = state["party_count"] >= 1 and state["party_levels"] >= 1
+                if task_success:
+                    component["task_success"] = TASK_SUCCESS_REWARD
+                    info["task_success"] = True
+                    # Training/evaluation need terminal episodes for PPO success signals.
+                    # Watch mode stays in the success scene until the watcher stops, so
+                    # the vector wrapper cannot immediately auto-reset the screen.
+                    if MODE in {"train", "evaluate"}:
+                        terminated = True
+                else:
+                    info["task_success"] = False
+
                 info.update({
                     "party_count": state["party_count"],
                     "party_levels": state["party_levels"],
                     "new_badges": new_badges,
+                    "badge_count": state.get("badge_count", int(state["badge_flags"]).bit_count()),
                     "map_id": map_id,
+                    "map_group": state.get("map_group", -1),
+                    "map_number": state.get("map_number", -1),
                     "player_x": player_x if player_x is not None else -1,
                     "player_y": player_y if player_y is not None else -1,
                     "new_area_discovered": new_area_discovered,
                     "new_tile_discovered": new_tile_discovered,
-                    "level_reward": level_reward,
-                    "badge_reward": badge_reward,
-                    "exploration_reward": exploration_reward,
-                    "tile_reward": tile_reward,
-                    "story_reward": story_reward,
-                    "party_reward": party_reward,
-                    "party_members_added": party_members_added,
+                    "new_story_flags": len(new_story_flags),
+                    "new_trainer_flags": len(new_trainer_flags),
+                    "new_badges_this_step": new_badges,
+                    "unique_tiles_episode": len(self.visited_tiles),
+                    "unique_maps_episode": len(self.visited_maps),
+                    "story_flags_episode": len(self.seen_story_flags),
+                    "trainer_flags_episode": len(self.seen_trainer_flags),
+                    # Public metric aliases: keep each component separately inspectable.
+                    "step_reward": component["step"],
+                    "tile_reward": component["tile"],
+                    "map_reward": component["map"],
+                    "exploration_reward": component["tile"] + component["map"] + component["screen"],
+                    "screen_reward": component["screen"],
+                    "new_screen_discovered": new_screen_discovered,
+                    "unique_screens_episode": len(self.seen_screen_signatures),
+                    "level_reward": component["level"],
+                    "badge_reward": component["badge"],
+                    "story_reward": component["story"],
+                    "party_reward": component["party"],
+                    "trainer_reward": component["trainer"],
+                    "loop_penalty": component["loop"],
+                    "task_success_reward": component["task_success"],
                 })
                 self._memory_read_warning_printed = False
             except Exception as e:
-                # Safe fallback reward if memory reads fluctuate; log the issue once so mapping errors are visible.
                 if not self._memory_read_warning_printed:
-                    print(f"[RAM Warning] Reward memory read failed; only step penalty will be used: {e}")
+                    print(f"[RAM Warning] Reward memory read failed; only step penalty will be used: {e}", flush=True)
                     self._memory_read_warning_printed = True
-                reward = -STEP_PENALTY
+                state = None
+                component = {name: 0.0 for name in REWARD_COMPONENT_NAMES}
+                component["step"] = -STEP_PENALTY
+                self._last_game_state = None
+
+        reward = float(sum(component.values()))
+        for component_name, component_value in component.items():
+            self.episode_reward_components[component_name] += float(component_value)
+            info[f"reward_{component_name}"] = float(component_value)
+            info[f"episode_{component_name}_sum"] = float(self.episode_reward_components[component_name])
+        info["episode_reward_total_so_far"] = float(sum(self.episode_reward_components.values()))
+
+        # The next observation sees the updated visited-tile map and decoded state.
+        obs = self._get_obs(game_state=state, read_state=False, screen=screen_frame)
 
         # Record frame if enabled
         if self.video_writer is not None and self._last_raw_frame_rgb is not None:
@@ -2378,31 +2866,62 @@ class EmeraldEnv(gym.Env):
             self.video_writer.write(frame_bgr)
 
         # The GUI was rendered immediately after frame acquisition above.
-        terminated = False
-        truncated = MODE != "setup" and self.episode_step_counter >= MAX_EPISODE_STEPS
+        # Training is episodic. Watch mode deliberately has NO automatic time-limit reset:
+        # the policy keeps playing the same game indefinitely until q/Esc/Ctrl+C.
+        truncated = _episode_time_limit_reached(MODE, self.episode_step_counter)
         if self.stop_requested or STOP_REQUESTED:
             truncated = True
             info["stopped"] = True
-        elif truncated:
+        if truncated:
             info["TimeLimit.truncated"] = True
-
+        if terminated or truncated:
+            outcome = "SUCCESS" if terminated and info.get("task_success") else ("TIMEOUT" if truncated and not info.get("stopped") else "STOPPED")
+            info["episode_outcome"] = outcome
+            reward_breakdown = ", ".join(
+                f"{name}={value:+.2f}"
+                for name, value in self.episode_reward_components.items()
+                if abs(value) >= 0.005
+            ) or "no nontrivial reward components"
+            print(
+                f"[Episode {self.env_id}] {outcome} | steps={self.episode_step_counter:,} | "
+                f"return={sum(self.episode_reward_components.values()):.3f} | "
+                f"tiles={len(self.visited_tiles)} maps={len(self.visited_maps)} "
+                f"story_flags={len(self.seen_story_flags)} trainers={len(self.seen_trainer_flags)} | "
+                f"map={info.get('map_id', -1)} pos=({info.get('player_x', -1)},{info.get('player_y', -1)}) | "
+                f"rewards: {reward_breakdown}",
+                flush=True,
+            )
         return obs, float(reward), terminated, truncated, info
 
 
     def _decode_gui_key(self, key):
-        """Handle window close/pause and return an optional manual action index."""
+        """Decode keyboard input without confusing OpenCV's left-arrow code with Q."""
         if key < 0:
             return None
-        normalized = key & 0xFF
 
-        if normalized in (ord("q"), ord("Q"), 27):
+        # On X11/OpenCV waitKeyEx, left arrow is commonly 65361. Some fallbacks expose
+        # only the low byte (81), which equals ASCII 'Q'. Handle navigation codes first.
+        arrow_to_action = {
+            65362: 1, 82: 1,   # Up
+            65364: 2, 84: 2,   # Down
+            65361: 3, 81: 3,   # Left (must never be treated as quit)
+            65363: 4, 83: 4,   # Right
+        }
+        if key in arrow_to_action:
+            return arrow_to_action[key] if HOST_CONTROL_ENABLED and MODE in {"watch", "setup"} else None
+
+        normalized = key & 0xFF
+        # Lowercase q and Escape are unambiguous across OpenCV backends. Some waitKey
+        # backends collapse Left to 81, which is also uppercase ASCII Q; the arrow mapping
+        # above wins in that case to prevent the left-arrow key from accidentally closing the GUI.
+        if key == 27 or key == ord("q"):
             self.stop_requested = True
-            print("[GUI] Quit requested; saving checkpoints and shutting down cleanly...")
+            print("[GUI] Quit requested; saving checkpoints and shutting down cleanly...", flush=True)
             return None
 
         if normalized in (ord("p"), ord("P")):
             self.paused = not self.paused
-            print("[GUI] Paused." if self.paused else "[GUI] Resumed.")
+            print("[GUI] Paused." if self.paused else "[GUI] Resumed.", flush=True)
             return None
 
         if normalized in (ord("m"), ord("M")):
@@ -2417,15 +2936,14 @@ class EmeraldEnv(gym.Env):
         if not (HOST_CONTROL_ENABLED and MODE in {"watch", "setup"}):
             return None
 
-        # OpenCV's waitKeyEx arrow codes differ slightly by platform; cover common X11/Linux and waitKey codes.
         key_to_action = {
-            ord("w"): 0, ord("W"): 0, 65362: 0, 82: 0,
-            ord("s"): 1, ord("S"): 1, 65364: 1, 84: 1,
-            ord("a"): 2, ord("A"): 2, 65361: 2, 81: 2,
-            ord("d"): 3, ord("D"): 3, 65363: 3, 83: 3,
-            ord("z"): 4, ord("Z"): 4, 13: 4, 10: 4,
-            ord("x"): 5, ord("X"): 5, 8: 5, 127: 5,
-            ord("1"): 6, ord("2"): 7,
+            ord("w"): 1, ord("W"): 1,
+            ord("s"): 2, ord("S"): 2,
+            ord("a"): 3, ord("A"): 3,
+            ord("d"): 4, ord("D"): 4,
+            ord("z"): 5, ord("Z"): 5, 13: 5, 10: 5,
+            ord("x"): 6, ord("X"): 6, 8: 6, 127: 6,
+            ord("1"): 7, ord("2"): 8,
         }
         return key_to_action.get(key, key_to_action.get(normalized))
 
@@ -2471,9 +2989,9 @@ class EmeraldEnv(gym.Env):
             else:
                 mute_hint = "M: mute"
             if MODE == "setup":
-                footer = f"Arrows/WASD move | Z/Enter=A | X/Backspace=B | 1=Start | 2=Select | K=save start | Q=quit | P=pause | {mute_hint}"
+                footer = f"Arrows/WASD move | Z/Enter=A | X/Backspace=B | 1=Start | 2=Select | K=save start | q/Esc=quit | P=pause | {mute_hint}"
             else:
-                footer = f"Q/Esc: quit | P: pause | {mute_hint}"
+                footer = f"q/Esc: quit | P: pause | {mute_hint}"
             cv2.putText(frame_bgr, footer, (12, height - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45 if MODE == "setup" else 0.52, (255, 255, 255), 1, cv2.LINE_AA)
             cv2.imshow(GUI_WINDOW_TITLE, frame_bgr)
 
@@ -2789,6 +3307,9 @@ class StopAndCheckpointCallback(BaseCallback):
         self._last_episode_reward = None
         self._last_episode_length = None
         self._episode_running_rewards = np.zeros(1, dtype=np.float64)
+        self._recent_episode_success = deque(maxlen=100)
+        self._task_successes = 0
+        self._timeouts = 0
 
     def _on_training_start(self):
         # On resumed training, num_timesteps can already be very large. Anchor the
@@ -2798,16 +3319,24 @@ class StopAndCheckpointCallback(BaseCallback):
         self._last_progress_timestep = int(self.num_timesteps)
         self._run_started_at = time.perf_counter()
         self._recent_rewards.clear()
+        self._recent_episode_success.clear()
         env_count = int(getattr(self.training_env, "num_envs", NUM_CPU))
         self._episode_running_rewards = np.zeros(max(1, env_count), dtype=np.float64)
         print(
             f"[Training] Started | mode={'GUI' if GUI_MODE else 'HEADLESS'} | "
-            f"envs={env_count} | action_repeat={ACTION_REPEAT} | "
+            f"envs={env_count} | action_repeat={ACTION_REPEAT}+{ACTION_RELEASE_FRAMES} release frames | "
             f"SB3 verbosity={VERBOSE_LEVEL} | mGBA log mask={_MGBA_LOG_LEVEL_MASK} | "
             f"checkpoint every {self.save_frequency:,} transitions | "
             f"progress every {self.progress_frequency:,} transitions.",
             flush=True,
         )
+
+    def _on_rollout_end(self):
+        """Anneal exploration pressure instead of keeping a random-looking policy forever."""
+        elapsed = max(0, int(self.num_timesteps) - self._run_start_timestep)
+        progress = min(1.0, elapsed / float(max(1, TOTAL_TIMESTEPS)))
+        self.model.ent_coef = ENTROPY_COEF_START + (ENTROPY_COEF_END - ENTROPY_COEF_START) * progress
+        self.logger.record("progress/entropy_coefficient", float(self.model.ent_coef))
 
     def _on_step(self):
         rewards = np.asarray(self.locals.get("rewards", []), dtype=np.float64).reshape(-1)
@@ -2842,9 +3371,23 @@ class StopAndCheckpointCallback(BaseCallback):
                 self._last_episode_reward = float(episode["r"])
                 self._last_episode_length = int(episode.get("l", 0))
 
+        # Monitor/VecEnv marks a finished episode in dones. Track task outcomes separately
+        # from reward so a positive score cannot masquerade as successful gameplay.
+        dones = np.asarray(self.locals.get("dones", []), dtype=bool).reshape(-1)
+        for env_index, done in enumerate(dones):
+            if not done or env_index >= len(infos_list):
+                continue
+            terminal_info = infos_list[env_index]
+            success = bool(terminal_info.get("task_success", False))
+            outcome = terminal_info.get("episode_outcome", "TIMEOUT")
+            self._recent_episode_success.append(1 if success else 0)
+            if success:
+                self._task_successes += 1
+            elif outcome == "TIMEOUT":
+                self._timeouts += 1
+
         # Monitor/VecEnv marks a finished episode in dones. Reset its live return
         # after including that transition's reward, so the display tracks each new episode.
-        dones = np.asarray(self.locals.get("dones", []), dtype=bool).reshape(-1)
         for env_index, done in enumerate(dones[:self._episode_running_rewards.size]):
             if done:
                 self._episode_running_rewards[env_index] = 0.0
@@ -2872,25 +3415,75 @@ class StopAndCheckpointCallback(BaseCallback):
                 f"progress/live_episode_reward_env_{env_index}", float(running_reward)
             )
 
+        for component_name in REWARD_COMPONENT_NAMES:
+            component_values = [
+                float(info[f"episode_{component_name}_sum"])
+                for info in infos_list
+                if isinstance(info, dict)
+                and isinstance(info.get(f"episode_{component_name}_sum"), (int, float, np.integer, np.floating))
+            ]
+            if component_values:
+                # Mean cumulative reward contribution across workers; terminal episodes
+                # carry their final totals in the same info dict.
+                self.logger.record(
+                    f"progress/episode_{component_name}_sum", float(np.mean(component_values))
+                )
+        if self._recent_episode_success:
+            self.logger.record("progress/task_success_rate_last_100_episodes", float(np.mean(self._recent_episode_success)))
+        self.logger.record("progress/task_successes_total", float(self._task_successes))
+        self.logger.record("progress/timeouts_total", float(self._timeouts))
+
         elapsed = max(1e-6, time.perf_counter() - self._run_started_at)
         steps_per_second = (int(self.num_timesteps) - self._run_start_timestep) / elapsed
         self.logger.record("progress/transitions_per_second", float(steps_per_second))
-        for info_key, tb_key in (
+        scalar_metric_map = (
             ("party_count", "progress/party_count"),
             ("party_levels", "progress/party_total_levels"),
+            ("badge_count", "progress/badge_count"),
             ("new_badges", "progress/new_badges_this_step"),
-            ("map_id", "progress/map_id"),
             ("level_reward", "progress/level_reward"),
             ("badge_reward", "progress/badge_reward"),
             ("exploration_reward", "progress/exploration_reward"),
+            ("map_reward", "progress/map_reward"),
             ("tile_reward", "progress/tile_reward"),
+            ("screen_reward", "progress/screen_reward"),
+            ("unique_screens_episode", "progress/unique_screens_episode"),
             ("story_reward", "progress/story_reward"),
             ("party_reward", "progress/party_reward"),
+            ("trainer_reward", "progress/trainer_reward"),
+            ("loop_penalty", "progress/loop_penalty"),
+            ("task_success_reward", "progress/task_success_reward"),
             ("party_members_added", "progress/party_members_added"),
             ("new_tile_discovered", "progress/new_tile_discovered"),
+            ("new_area_discovered", "progress/new_area_discovered"),
+            ("new_story_flags", "progress/new_story_flags"),
+            ("new_trainer_flags", "progress/new_trainer_flags"),
+            ("unique_tiles_episode", "progress/unique_tiles_episode"),
+            ("unique_maps_episode", "progress/unique_maps_episode"),
+            ("trainer_flags_episode", "progress/trainer_flags_episode"),
+        )
+        for info_key, tb_key in scalar_metric_map:
+            metric_values = [
+                float(info[info_key])
+                for info in infos_list
+                if isinstance(info, dict)
+                and isinstance(info.get(info_key), (int, float, bool, np.integer, np.floating))
+            ]
+            if metric_values:
+                self.logger.record(tb_key, float(np.mean(metric_values)))
+
+        # Map ID and coordinates are categorical/per-worker state, so do not average
+        # them into a meaningless fractional location when several emulators are active.
+        for info_key, tb_key in (
+            ("map_id", "progress/map_id"),
+            ("map_group", "progress/map_group"),
+            ("map_number", "progress/map_number"),
             ("player_x", "progress/player_x"),
             ("player_y", "progress/player_y"),
         ):
+            for env_index, info in enumerate(infos_list):
+                if isinstance(info, dict) and isinstance(info.get(info_key), (int, float, bool, np.integer, np.floating)):
+                    self.logger.record(f"{tb_key}_env_{env_index}", float(info[info_key]))
             value = latest_info.get(info_key)
             if isinstance(value, (int, float, bool, np.integer, np.floating)):
                 self.logger.record(tb_key, float(value))
@@ -2916,7 +3509,7 @@ class StopAndCheckpointCallback(BaseCallback):
                 env_status = f"envs={env_count} (in-process)"
 
             per_env_speed = steps_per_second / max(1, env_count)
-            aggregate_gba_fps = steps_per_second * max(1, ACTION_REPEAT)
+            aggregate_gba_fps = steps_per_second * max(1, ACTION_REPEAT + ACTION_RELEASE_FRAMES)
             if self._last_episode_reward is not None:
                 episode_text = f", last_episode_reward={self._last_episode_reward:.2f}"
             else:
@@ -2932,6 +3525,13 @@ class StopAndCheckpointCallback(BaseCallback):
                 )
             else:
                 live_reward_text = f"live_episode_reward={live_episode_reward_mean:.2f}"
+            reward_part_names = ("tile_reward", "map_reward", "screen_reward", "story_reward", "party_reward", "level_reward", "badge_reward", "trainer_reward", "loop_penalty", "task_success_reward")
+            reward_part_text = ",".join(
+                f"{key.removesuffix('_reward').removesuffix('_penalty').removesuffix('_success')}={np.mean([float(info[key]) for info in infos_list if isinstance(info, dict) and isinstance(info.get(key), (int, float, np.integer, np.floating))]):+.3f}"
+                for key in reward_part_names
+                if any(isinstance(info, dict) and isinstance(info.get(key), (int, float, np.integer, np.floating)) for info in infos_list)
+            )
+            success_rate = float(np.mean(self._recent_episode_success)) if self._recent_episode_success else 0.0
             print(
                 f"[Training] run={run_transitions:,}/{run_target:,} ({progress_percent:.2f}%) | "
                 f"total_timesteps={int(self.num_timesteps):,} | "
@@ -2940,7 +3540,9 @@ class StopAndCheckpointCallback(BaseCallback):
                 f"{env_status} | elapsed={_format_duration(elapsed_seconds)} "
                 f"ETA={_format_duration(remaining_seconds)} | action={action_text} | "
                 f"step_reward={self._last_step_reward:.3f}, mean_reward_1k={recent_mean:.3f} | "
-                f"{live_reward_text} | episodes={self._completed_episodes}{episode_text}",
+                f"{live_reward_text} | episodes={self._completed_episodes}{episode_text} | "
+                f"task_successes={self._task_successes}, timeouts={self._timeouts}, success_rate_100={success_rate:.1%} | "
+                f"reward_parts[{reward_part_text or 'n/a'}]",
                 flush=True,
             )
             # Flush the custom progress scalars now instead of waiting for PPO's full
@@ -3221,14 +3823,54 @@ if __name__ == "__main__":
 
         if MODE == "train":
             print("--------------------------------------------------")
-            print(f" [MODE] TRAINING ACTIVE ({NUM_CPU} Environment(s)). Press Ctrl+C or Q in GUI to stop and save.")
+            print(f" [MODE] TRAINING ACTIVE ({NUM_CPU} Environment(s)). Press Ctrl+C or q/Esc in GUI to stop and save.")
             print("--------------------------------------------------")
 
-            if os.path.exists(model_file_path):
-                print(f"[Load] Resuming training weights from {model_file_path}...")
-                model = PPO.load(MODEL_CHECKPOINT, env=env, verbose=VERBOSE_LEVEL, tensorboard_log=TENSORBOARD_LOG_DIR)
+            if os.path.exists(model_file_path) and RESUME_TRAINING:
+                print(f"[Load] Resuming hybrid policy from {model_file_path}...")
+                try:
+                    model = PPO.load(MODEL_CHECKPOINT, env=env, device="cpu", verbose=VERBOSE_LEVEL, tensorboard_log=TENSORBOARD_LOG_DIR)
+                    _get_compatible_model_env(model, "Training resume")
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Checkpoint {model_file_path} is incompatible with the current hybrid observations/action space. "
+                        f"Preserve it and set POKEMON_AI_MODEL_NAME to a new filename before training. Cause: {exc}"
+                    ) from exc
+            elif os.path.exists(model_file_path) and not RESUME_TRAINING:
+                raise FileExistsError(
+                    f"POKEMON_AI_RESUME=0 means start fresh, but {model_file_path} already exists. "
+                    "To avoid overwriting learned weights, rename that checkpoint or set POKEMON_AI_MODEL_NAME "
+                    "to a new unique filename, then run again."
+                )
             else:
-                model = PPO("CnnPolicy", env, verbose=VERBOSE_LEVEL, tensorboard_log=TENSORBOARD_LOG_DIR)
+                print(
+                    "[Training] Starting a fresh recurrent hybrid policy (screenshots + game state + "
+                    "visited-tile memory + LSTM temporal memory).",
+                    flush=True,
+                )
+                model = PPO(
+                    "MultiInputLstmPolicy", env, device="cpu", verbose=VERBOSE_LEVEL,
+                    tensorboard_log=TENSORBOARD_LOG_DIR,
+                    n_steps=PPO_N_STEPS,
+                    batch_size=PPO_BATCH_SIZE,
+                    n_epochs=PPO_N_EPOCHS,
+                    gamma=PPO_GAMMA,
+                    gae_lambda=PPO_GAE_LAMBDA,
+                    learning_rate=PPO_LEARNING_RATE,
+                    ent_coef=ENTROPY_COEF_START,
+                    policy_kwargs={
+                        "net_arch": {"pi": [128, 128], "vf": [128, 128]},
+                        "lstm_hidden_size": int(os.environ.get("POKEMON_AI_LSTM_HIDDEN_SIZE", "128")),
+                        "n_lstm_layers": 1,
+                    },
+                )
+                print(
+                    f"[Training] RecurrentPPO: n_steps={PPO_N_STEPS}, batch={PPO_BATCH_SIZE}, "
+                    f"gamma={PPO_GAMMA}, gae_lambda={PPO_GAE_LAMBDA}, "
+                    f"entropy={ENTROPY_COEF_START}->{ENTROPY_COEF_END}, "
+                    f"episode_limit={MAX_EPISODE_STEPS} actions.",
+                    flush=True,
+                )
 
             try:
                 model.learn(
@@ -3251,16 +3893,115 @@ if __name__ == "__main__":
             else:
                 print(f"[Complete] Training call finished. Model saved; configured timestep target was {TOTAL_TIMESTEPS}.")
 
+        elif MODE == "evaluate":
+            print("--------------------------------------------------")
+            print(
+                f" [MODE] {'DETERMINISTIC' if EVAL_DETERMINISTIC else 'STOCHASTIC'} EVALUATION | "
+                f"episodes={EVAL_EPISODES} | max_steps={MAX_EPISODE_STEPS}."
+            )
+            print(" [MODE] Uses the canonical training start, no training updates, no GUI and no video.")
+            print("--------------------------------------------------", flush=True)
+
+            chosen_checkpoint = MODEL_CHECKPOINT
+            chosen_file = f"{chosen_checkpoint}.zip"
+            if not os.path.isfile(chosen_file):
+                raise FileNotFoundError(
+                    f"No evaluation checkpoint found: {chosen_file}. Train the hybrid policy first."
+                )
+            model = PPO.load(chosen_checkpoint, env=env, device="cpu")
+            model_env = _get_compatible_model_env(model, "Evaluation")
+            print(f"[Evaluation] Loaded {chosen_file}", flush=True)
+
+            observation = model_env.reset()
+            lstm_states = None
+            episode_starts = np.ones((int(getattr(model_env, "num_envs", 1)),), dtype=bool)
+            results = []
+            for episode_index in range(1, EVAL_EPISODES + 1):
+                episode_return = 0.0
+                episode_steps = 0
+                episode_success = False
+                episode_outcome = "UNKNOWN"
+                episode_action_counts = Counter()
+                last_info = {}
+                last_action_name = "unknown"
+                while not STOP_REQUESTED and episode_steps < MAX_EPISODE_STEPS:
+                    action, lstm_states = model.predict(
+                        observation,
+                        state=lstm_states,
+                        episode_start=episode_starts,
+                        deterministic=EVAL_DETERMINISTIC,
+                    )
+                    action_ids = np.asarray(action).reshape(-1)
+                    for action_id in action_ids:
+                        episode_action_counts[int(action_id)] += 1
+                    last_action_name = ",".join(
+                        ACTION_LABELS.get(int(action_id), f"action_{int(action_id)}")
+                        for action_id in action_ids
+                    )
+                    observation, rewards, dones, infos = model_env.step(action)
+                    episode_starts = np.asarray(dones, dtype=bool).reshape(-1)
+                    last_info = infos[0] if infos and isinstance(infos[0], dict) else {}
+                    episode_return += float(np.asarray(rewards, dtype=np.float64).reshape(-1)[0])
+                    episode_steps += 1
+
+                    if episode_steps % EVAL_DIAGNOSTICS_EVERY == 0:
+                        pos_x = last_info.get("player_x", "?")
+                        pos_y = last_info.get("player_y", "?")
+                        print(
+                            f"[Evaluation Diagnostic] episode={episode_index} step={episode_steps:,} "
+                            f"last_action={last_action_name} pos=({pos_x},{pos_y}) "
+                            f"map={last_info.get('map_id', '?')} "
+                            f"party={last_info.get('party_count', '?')} "
+                            f"tiles={last_info.get('unique_tiles_episode', '?')} "
+                            f"maps={last_info.get('unique_maps_episode', '?')} "
+                            f"story_flags={last_info.get('story_flags_episode', '?')} "
+                            f"actions=[{_format_action_distribution(episode_action_counts)}]",
+                            flush=True,
+                        )
+
+                    if bool(np.asarray(dones, dtype=bool).reshape(-1)[0]):
+                        episode_success = bool(last_info.get("task_success", False))
+                        episode_outcome = str(last_info.get("episode_outcome", "SUCCESS" if episode_success else "TIMEOUT"))
+                        if isinstance(last_info.get("episode"), dict):
+                            episode_return = float(last_info["episode"].get("r", episode_return))
+                            episode_steps = int(last_info["episode"].get("l", episode_steps))
+                        break
+                if STOP_REQUESTED:
+                    print("[Evaluation] Interrupted by user.", flush=True)
+                    break
+                results.append((episode_success, episode_return, episode_steps, episode_outcome))
+                print(
+                    f"[Evaluation Episode {episode_index}/{EVAL_EPISODES}] {episode_outcome} | "
+                    f"success={episode_success} | return={episode_return:.3f} | steps={episode_steps:,} | "
+                    f"actions=[{_format_action_distribution(episode_action_counts)}]",
+                    flush=True,
+                )
+                # DummyVecEnv/SubprocVecEnv already autoresets on done. If an unexpected
+                # loop exit did not produce done, force a clean canonical start before next test.
+                if episode_steps < MAX_EPISODE_STEPS and not episode_success and episode_outcome == "UNKNOWN":
+                    observation = model_env.reset()
+                    lstm_states = None
+                    episode_starts = np.ones((int(getattr(model_env, "num_envs", 1)),), dtype=bool)
+            if results:
+                success_rate = sum(1 for success, *_ in results if success) / len(results)
+                mean_return = float(np.mean([episode_return for _, episode_return, _, _ in results]))
+                mean_steps = float(np.mean([episode_steps for _, _, episode_steps, _ in results]))
+                timeouts = sum(1 for _, _, _, outcome in results if outcome == "TIMEOUT")
+                print(
+                    f"[Evaluation Summary] episodes={len(results)} | success_rate={success_rate:.1%} | "
+                    f"mean_return={mean_return:.3f} | mean_steps={mean_steps:.0f} | timeouts={timeouts}",
+                    flush=True,
+                )
+            else:
+                print("[Evaluation Summary] No complete episodes were evaluated.", flush=True)
+
         elif MODE == "setup":
             print("--------------------------------------------------")
             print(" [MODE] HUMAN SETUP. Control the game manually; this mode does not run PPO.")
-            if TRAINING_START_STAGE == "clock_set":
-                print(" [MODE] Set and confirm the bedroom clock, wait until the menu/dialogue closes, then press K.")
-                print(" [MODE] You do not need a starter Pokémon for the clock_set stage.")
-            else:
-                print(" [MODE] Complete the introduction, obtain your starter, reach free movement, then press K.")
-            print(f" [MODE] Selected stage={TRAINING_START_STAGE}; save path: {TRAINING_START_STATE}")
-            print(" [MODE] Controls: arrows/WASD move, Z/Enter=A, X/Backspace=B, 1=Start, 2=Select, K=save, P=pause, Q/Esc=quit.")
+            print(" [MODE] Save only when the character is on Route 101, the clock is set, and no starter is in the party.")
+            print(f" [MODE] Training start save path: {TRAINING_START_STATE}")
+            print(f" [MODE] RAM diagnostic interval: every {SETUP_DIAGNOSTICS_EVERY} actions.")
+            print(" [MODE] Controls: arrows/WASD move, Z/Enter=A, X/Backspace=B, 1=Start, 2=Select, K=save, P=pause, lowercase q/Esc=quit.")
             print("--------------------------------------------------", flush=True)
             env.reset()
             setup_steps = 0
@@ -3273,8 +4014,25 @@ if __name__ == "__main__":
                         break
                 except Exception:
                     pass
-                if setup_steps % 30000 == 0:
-                    print(f"[Setup] Manual setup active for {setup_steps:,} neutral/action steps.", flush=True)
+                if setup_steps % SETUP_DIAGNOSTICS_EVERY == 0:
+                    try:
+                        states = env.env_method("_read_game_state")
+                        for worker_index, state in enumerate(states):
+                            story = state.get("story_flags", set())
+                            print(
+                                f"[Setup RAM] env={worker_index} step={setup_steps:,} "
+                                f"map={state.get('map_id', -1)} "
+                                f"group={state.get('map_group', -1)} number={state.get('map_number', -1)} "
+                                f"pos=({state.get('player_x')},{state.get('player_y')}) "
+                                f"party={state.get('party_count', 0)} levels={state.get('party_levels', 0)} "
+                                f"badges={state.get('badge_count', 0)} "
+                                f"clock_set={CLOCK_SET_FLAG_ID in story} "
+                                f"starter_flag={STARTER_OBTAINED_FLAG_ID in story} "
+                                f"pokedex_flag={POKEDEX_OBTAINED_FLAG_ID in story}",
+                                flush=True,
+                            )
+                    except Exception as exc:
+                        print(f"[Setup RAM Warning] Could not read diagnostics: {exc}", flush=True)
             print("[Setup] Manual setup stopped. If you pressed K, the training start state is saved.", flush=True)
 
         elif MODE == "watch":
@@ -3288,9 +4046,15 @@ if __name__ == "__main__":
                 )
 
             model = PPO.load(MODEL_CHECKPOINT, env=env, device="cpu")
-            print(f"[Load] Loaded model weights from {model_file_path}")
-            send_notification("Pokémon AI Watch Mode", "Playback started. Q/Esc quits; P pauses/resumes.")
+            model_env = _get_compatible_model_env(model, "Watch mode")
+            print(f"[Load] Loaded hybrid policy weights from {model_file_path}")
+            send_notification("Pokémon AI Watch Mode", "Playback started. q/Esc quits; P pauses/resumes.")
 
+            print(
+                f"[Watch] Action selection: {'STOCHASTIC' if STOCHASTIC_WATCH else 'DETERMINISTIC'}.",
+                flush=True,
+            )
+            print("[Watch] Plays from the canonical Route 101 start and stops when the first starter is obtained.", flush=True)
             if GUI_MODE:
                 print("[Watch] GUI playback is paced by GUI_FPS; use POKEMON_AI_GUI_MODE=0 for headless playback.", flush=True)
             elif WATCH_FPS_CAP == 0:
@@ -3306,7 +4070,9 @@ if __name__ == "__main__":
                     flush=True,
                 )
 
-            obs = env.reset()
+            obs = model_env.reset()
+            lstm_states = None
+            episode_starts = np.ones((int(getattr(model_env, "num_envs", 1)),), dtype=bool)
             watch_started = time.perf_counter()
             watch_last_report = watch_started
             watch_steps = 0
@@ -3315,10 +4081,17 @@ if __name__ == "__main__":
             watch_episode_reward = 0.0
             watch_last_step_reward = 0.0
             watch_recent_rewards = deque(maxlen=PROGRESS_LOG_FREQUENCY)
+            watch_task_completed = False
             while not STOP_REQUESTED:
-                action, _states = model.predict(obs, deterministic=(not STOCHASTIC_WATCH))
-                obs, rewards, dones, infos = env.step(action)
-                watch_steps += int(getattr(env, "num_envs", 1))
+                action, lstm_states = model.predict(
+                    obs,
+                    state=lstm_states,
+                    episode_start=episode_starts,
+                    deterministic=(not STOCHASTIC_WATCH),
+                )
+                obs, rewards, dones, infos = model_env.step(action)
+                episode_starts = np.asarray(dones, dtype=bool).reshape(-1)
+                watch_steps += int(getattr(model_env, "num_envs", 1))
                 reward_values = np.asarray(rewards, dtype=np.float64).reshape(-1)
                 if reward_values.size:
                     watch_last_step_reward = float(np.mean(reward_values))
@@ -3326,6 +4099,19 @@ if __name__ == "__main__":
                     watch_episode_reward += float(np.sum(reward_values))
                 info_values = infos if isinstance(infos, (list, tuple)) else []
                 done_values = np.asarray(dones, dtype=bool).reshape(-1)
+                # Stop at the requested starter milestone instead of continuing into
+                # gameplay the model was never trained to handle.
+                if any(
+                    isinstance(info, dict) and info.get("task_success", False)
+                    for info in info_values
+                ):
+                    watch_task_completed = True
+                    print(
+                        "[Watch] TASK SUCCESS: starter obtained. Stopping at the objective; "
+                        "START/SELECT remain available and are not blocked.",
+                        flush=True,
+                    )
+                    break
                 if done_values.any():
                     for i, done in enumerate(done_values):
                         if done:
@@ -3346,7 +4132,7 @@ if __name__ == "__main__":
                     recent_mean = float(np.mean(watch_recent_rewards)) if watch_recent_rewards else 0.0
                     print(
                         f"[Watch] steps={watch_steps:,} | speed={speed:.1f} transitions/s "
-                        f"(~{speed * ACTION_REPEAT:.1f} GBA frames/s) | elapsed={_format_duration(elapsed)} | "
+                        f"(~{speed * (ACTION_REPEAT + ACTION_RELEASE_FRAMES):.1f} GBA frames/s) | elapsed={_format_duration(elapsed)} | "
                         f"step_reward={watch_last_step_reward:.3f} | "
                         f"recent_mean_reward={recent_mean:.3f} | "
                         f"live_episode_reward={watch_episode_reward:.2f} | episodes={watch_completed_episodes}",
@@ -3356,14 +4142,15 @@ if __name__ == "__main__":
                     watch_last_report_step = watch_steps
                 if GUI_MODE:
                     try:
-                        if any(env.get_attr("stop_requested")):
+                        if any(model_env.get_attr("stop_requested")):
                             break
                     except Exception:
                         pass
-            print("[Watch] Playback stopped.", flush=True)
+            if not watch_task_completed:
+                print("[Watch] Playback stopped before the starter objective completed.", flush=True)
 
         else:
-            raise ValueError(f"Unsupported MODE={MODE!r}; choose 'train', 'watch', or 'setup'.")
+            raise ValueError(f"Unsupported MODE={MODE!r}; choose 'train', 'watch', 'setup', or 'evaluate'.")
 
     except KeyboardInterrupt:
         STOP_REQUESTED = True

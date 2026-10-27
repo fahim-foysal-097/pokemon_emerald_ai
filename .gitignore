@@ -37,6 +37,8 @@ runtime_data/
 
 # PPO models and training artifacts (large, machine-specific)
 emerald_ppo_checkpoint*.zip
+emerald_ppo_hybrid*.zip
+emerald_ppo_*_best_success*.zip
 *.zip.bak
 *.pkl
 *.pt
