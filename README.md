@@ -32,6 +32,7 @@ You only need **one active `.env` file**. Change `POKEMON_AI_PROFILE` in it, or 
 |---|---|---:|
 | `fast_train` | **Default.** Headless PPO training, with TensorBoard enabled. | 4 by default (configurable) |
 | `gui_train` | Train while showing the game. | 1 |
+| `setup` | Human-controlled GUI to finish the introduction and save a canonical training start state with **K**. | 1 |
 | `gui_watch` | Load the trained policy and watch it in a GUI; recording is enabled by default. | 1 |
 | `fast_watch` | Load the trained policy and run headlessly at maximum practical speed; no video or TensorBoard server. | 1 |
 
@@ -55,6 +56,28 @@ Use `./run.sh` so it sets up `LD_LIBRARY_PATH` automatically and forwards the pr
 
 `--profile NAME` forces that profile's mode/gui/watch/video/TensorBoard defaults for this launch. Alternatively, edit the single line in `.env` and run `./run.sh` without an argument. The `.env` profile applies at startup; explicit settings exported in your shell can override it when you select the profile in `.env`.
 
+### Set up a training start state (recommended)
+
+The default curriculum stage is **`clock_set`**: complete the bedroom wall-clock interaction manually, then let PPO learn the remaining introduction, reach Professor Birch, and obtain the starter. This bypasses the clock menu that was blocking the earlier policy without skipping all the way to the main game.
+
+```bash
+./run.sh --profile setup
+```
+
+With the default `POKEMON_AI_START_STAGE=clock_set`, finish setting the clock, wait for the menu/dialogue to close so the character is controllable, and press **K** while still in the bedroom (before obtaining the starter). The code verifies Emerald's `FLAG_SET_WALL_CLOCK` story flag and valid player coordinates. It does **not** require a party Pokémon at this stage. Press **Q** or **Esc** to quit setup when the terminal confirms that `runtime_data/states/training_start.state` was saved.
+
+Then begin a clean training run:
+
+```bash
+./run.sh --profile fast_train
+```
+
+Set `POKEMON_AI_START_STAGE=starter` in `.env` to use the later curriculum stage instead. For that stage, complete the introduction, obtain your starter, reach a normal freely controllable location, then press **K**; validation will require a non-empty party with a valid level. The `clock_set` stage also supports tile-novelty rewards before the starter is obtained, so the agent can receive feedback for exploring its bedroom and finding the route out.
+
+Training requires the chosen start state by default and uses it in preference to older per-worker emulator snapshots. If you change the starting stage or state, remember that the existing PPO model checkpoint is not automatically discarded. For a clean first experiment, back up/move `emerald_ppo_checkpoint.zip` and its backup aside before training; otherwise, the app will resume its existing policy. To intentionally allow training without a prepared start state, set `POKEMON_AI_REQUIRE_START_STATE=0`.
+
+The setup GUI controls are **arrows/WASD** to move, **Z/Enter** for A, **X/Backspace** for B, **1** for Start, **2** for Select, **K** to save the training-start savestate, **P** to pause, and **Q/Esc** to quit. This is an emulator savestate (`.state`), not the cartridge `.sav`.
+
 ### Optional: edit `.env` instead
 
 For the normal default, leave this line as:
@@ -63,7 +86,7 @@ For the normal default, leave this line as:
 POKEMON_AI_PROFILE=fast_train
 ```
 
-Change only the value to `gui_train`, `gui_watch`, or `fast_watch`, save the file, and run `./run.sh`. To return to the default, set it back to `fast_train`.
+Change only the value to `gui_train`, `setup`, `gui_watch`, or `fast_watch`, save the file, and run `./run.sh`. To return to the default, set it back to `fast_train`.
 
 `POKEMON_AI_NUM_ENVS=4` controls the worker count for headless training; try `2`, `4`, or `6` to benchmark your CPU. GUI training and both watch profiles deliberately use one environment, regardless of that setting. Headless watch uses `POKEMON_AI_WATCH_FPS=0` (unlimited frame cap). Fast-forward makes simulation run faster; it does not make the policy reason better per action.
 
@@ -85,6 +108,10 @@ The `.sav` cartridge save and the `.zip` PPO model checkpoint are separate from 
 | `POKEMON_AI_FILTER_MGBA_CHATTER` | `1` | Filter routine BIOS SWI/DMA C stdout traces. Set `0` for full native output. |
 | `POKEMON_AI_FILTER_KNOWN_MGBA_WARNINGS` | `1` | Also filter only the repeated DMA source-zero and listed unused video-register messages seen with this setup. Set `0` to inspect them. Other warnings remain visible. |
 | `POKEMON_AI_ACTION_REPEAT` | `2` | Number of GBA frames per selected action. Keep `2` when continuing a checkpoint trained with this action timing. |
+| `POKEMON_AI_MAX_EPISODE_STEPS` | `20000` | Maximum policy actions per episode; set lower for diagnostic runs. |
+| `POKEMON_AI_REQUIRE_START_STATE` | `1` | Refuse training if no canonical savestate for the chosen curriculum stage has been captured. Set `0` only to allow cold-start training. |
+| `POKEMON_AI_START_STAGE` | `clock_set` | Starting curriculum: `clock_set` starts after the bedroom clock is set (no starter required); `starter` requires a valid party and is intended for later navigation/battle training. |
+| `POKEMON_AI_TRAINING_START_STATE` | `runtime_data/states/training_start.state` | Optional absolute or project-relative path to the canonical curriculum-start savestate. |
 | `POKEMON_AI_TOTAL_TIMESTEPS` | `1000000` | Additional PPO training transitions requested in a training call. This is aggregate transitions across vectorized environments. |
 | `POKEMON_AI_CHECKPOINT_EVERY` | `25000` | Transitions between periodic model and emulator-state checkpoints. |
 | `POKEMON_AI_PROGRESS_EVERY` | `1000` | Transitions between console progress summaries. This is not the save interval. |
@@ -105,8 +132,12 @@ Console reward values are **custom reinforcement-learning rewards**, not Pokémo
 - `mean_reward_1k` / `recent_mean_reward`: recent average reward.
 - `live_episode_reward`: rewards accumulated so far in the current episode.
 - `last_episode_reward`: most recently completed episode return.
+- `tile_reward`: one-time novelty bonus per episode for a new valid player tile, including before the first Pokémon in the `clock_set` stage. A tile cannot be farmed by revisiting it within the same episode; novelty resets when the emulator returns to the canonical episode start.
+- `story_reward`: one-time rewards for selected story flags, including setting the clock and getting the starter/Pokédex.
+- `party_reward`: reward when the party size increases.
+- `badge_reward`: based on official Emerald badge flags read from the dynamically located SaveBlock1.
 
-Reward is only one signal. Map changes, party levels, and badge changes are more interpretable game-progress indicators, and increasing reward alone does not prove that the agent is completing the game.
+Reward is only one signal. Map changes, player coordinates, party levels, party growth, story flags, and badge changes are more interpretable game-progress indicators, and increasing reward alone does not prove that the agent is completing the game. Party and badge values are read relative to Emerald's runtime SaveBlock1 pointer, because that save block can move in memory.
 
 A PPO transition is one policy decision/environment step, not one GBA frame. In parallel training, SB3's timestep counter aggregates transitions from all environments.
 
@@ -122,8 +153,16 @@ The code keeps runtime-only state and temporary artifacts out of the project roo
 | `PokemonEmerald.sav` | Persistent **cartridge save**, next to the ROM. In single-instance watch mode, the code creates/attaches it if missing when the mGBA binding supports explicit save-file loading. In training, no shared `.sav` is written because workers must not overwrite one another's save. |
 | `runtime_data/states/emerald_save.state` | Emulator savestate. This resumes the full emulated machine state; it is different from an in-game cartridge save. |
 | `runtime_data/states/emerald_save.worker_N.state` | Separate savestate for each parallel training worker. |
+| `runtime_data/states/training_start.state` | Canonical playable starting point loaded at the beginning of every training episode. |
 | `runtime_data/states/` | Episode-start fallback state files and temporary state-write files. |
 | `runtime_data/tmp/` | Temporary model archives, video intermediates, WAV audio, and mux files. |
+| `videos/` | Final video recordings. |
+| `tensorboard_logs/` | TensorBoard event data. |
+| `logs/run_*.log` | Per-run console logs. |
+| `logs/tensorboard_server.log` | TensorBoard server log. |
+| `logs/session_time_log.txt` | Session duration log. |
+| `.runtime/` | mGBA source/build artifacts created by the setup. |
+| `.venv/` | Python environment. |
 
 ### Checkpoint filename and recovery
 
@@ -155,14 +194,6 @@ PY
 ```
 
 After recovery, install the corrected `main.py` before starting another training run. The corrected saver passes a path ending in `.zip` to Stable-Baselines3 and verifies the same path, preventing suffix/path mismatches.
-| `videos/` | Final video recordings. |
-| `tensorboard_logs/` | TensorBoard event data. |
-| `logs/run_*.log` | Per-run console logs. |
-| `logs/tensorboard_server.log` | TensorBoard server log. |
-| `logs/session_time_log.txt` | Session duration log. |
-| `.runtime/` | mGBA source/build artifacts created by the setup. |
-| `.venv/` | Python environment. |
-
 On first launch after this update, old root-level `emerald_save.state`, worker-state files, and `session_time_log.txt` are migrated into the new folders if their destinations don't already exist. Migration copies and verifies before publishing the new file and only removes the old copy after success. If a new destination already exists, the old file is left untouched.
 
 **`.sav` versus `.state`:** a `.sav` stores Pokémon's in-game save data when the game itself saves. A `.state` stores a snapshot of the live emulator, including the exact point in gameplay. Training uses isolated temporary save data and relies on the PPO checkpoint plus per-worker emulator states; it should not write one shared cartridge `.sav` from multiple workers. For normal persistent in-game saves, run watch mode with a single emulator.
