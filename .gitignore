@@ -48,6 +48,7 @@ emerald_ppo_*_best_success*.zip
 # Logs and TensorBoard event data
 logs/
 tensorboard_logs/
+tensorboard_logs_v2/
 runs/
 events.out.tfevents.*
 session_time_log.txt
@@ -72,3 +73,5 @@ dist/
 *.log
 *.core
 core
+
+backup/
