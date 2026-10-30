@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import zipfile
 from pathlib import Path
 
@@ -16,6 +17,65 @@ import run_curriculum
 
 
 class CurriculumManagerTests(unittest.TestCase):
+
+    def test_curriculum_uses_shared_incremental_stage_plan(self):
+        from curriculum_objectives import CURRICULUM_PLAN_ID, OBJECTIVE_LABELS, STAGES
+        self.assertEqual(CURRICULUM_PLAN_ID, "emerald_intro_v4")
+        self.assertEqual(run_curriculum.STAGES, STAGES)
+        self.assertEqual(run_curriculum.OBJECTIVE_LABELS, OBJECTIVE_LABELS)
+        self.assertLess(STAGES.index("starter"), STAGES.index("leave_birch_lab"))
+        self.assertLess(STAGES.index("leave_birch_lab"), STAGES.index("reach_oldale"))
+        self.assertLess(STAGES.index("reach_route103"), STAGES.index("defeat_rival"))
+        self.assertLess(STAGES.index("return_birch_lab"), STAGES.index("pokedex"))
+
+    def test_stage_only_flag_uses_cli_or_env_and_defaults_off(self):
+        # main.py may load this project's .env into os.environ during unittest
+        # discovery. Isolate this test so the project's intentional
+        # POKEMON_AI_CURRICULUM_STAGE_ONLY=1 setting cannot change the default-off
+        # assertion. Runtime precedence remains shell environment > dotenv values.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("POKEMON_AI_CURRICULUM_STAGE_ONLY", None)
+            self.assertFalse(run_curriculum.stage_only_requested(False, {}))
+            self.assertTrue(run_curriculum.stage_only_requested(True, {}))
+            self.assertTrue(run_curriculum.stage_only_requested(
+                False, {"POKEMON_AI_CURRICULUM_STAGE_ONLY": "1"}
+            ))
+            self.assertFalse(run_curriculum.stage_only_requested(
+                False, {"POKEMON_AI_CURRICULUM_STAGE_ONLY": "0"}
+            ))
+
+    def test_stage_only_dry_run_skips_evaluation_and_promotion_plan(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "main.py").write_text("# fixture\n", encoding="utf-8")
+            (root / "PokemonEmerald.gba").write_bytes(b"rom")
+            (root / "emerald_ppo_hybrid_v1.zip").write_bytes(b"checkpoint-placeholder")
+            (root / "runtime_data/states/milestones").mkdir(parents=True)
+            prior_state = root / "runtime_data/states/milestones/starter.state"
+            prior_state.write_bytes(b"savestate-placeholder")
+            rom_hash = "f3ae088181bf583e55daf962a92bb46f4f1d07b7"
+            Path(str(prior_state) + ".json").write_text(
+                json.dumps({"objective": "starter", "rom_sha1_expected": rom_hash}), encoding="utf-8"
+            )
+            (root / ".env").write_text(
+                "POKEMON_AI_OBJECTIVE=leave_birch_lab\n"
+                "POKEMON_AI_CURRICULUM_STAGE_ONLY=1\n"
+                "POKEMON_AI_CURRICULUM_CHUNK_TIMESTEPS=122880\n"
+                "POKEMON_AI_CURRICULUM_MAX_CHUNKS_PER_STAGE=7\n"
+                f"POKEMON_AI_EXPECTED_ROM_SHA1={rom_hash}\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [sys.executable, str(Path(run_curriculum.__file__).resolve()), "--project-dir", str(root), "--dry-run"],
+                text=True, capture_output=True, timeout=10,
+            )
+        self.assertEqual(result.returncode, 0, msg=result.stderr + "\n" + result.stdout)
+        self.assertIn("STAGE-ONLY", result.stdout)
+        self.assertIn("Evaluation        : DISABLED", result.stdout)
+        self.assertIn("Promotion         : DISABLED", result.stdout)
+        self.assertNotIn("Evaluate current checkpoint", result.stdout)
+        self.assertNotIn("[Curriculum] $", result.stdout)
+
     def test_dotenv_parser_uses_first_occurrence_and_strips_quotes(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / ".env"
@@ -176,6 +236,25 @@ class CurriculumManagerTests(unittest.TestCase):
                         os.kill(child_pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+    def test_stream_command_persists_only_important_child_events(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            log_path = root / "concise.log"
+            child_code = (
+                "print('[Training] run=10,000/250,000 | speed=100/s', flush=True); "
+                "print('[Checkpoint] PPO model atomically saved at timestep 25,000', flush=True); "
+                "print('[Evaluation Diagnostic] step=10,000 action=B', flush=True); "
+                "print('[Curriculum Evaluation] stage=starter successes=5/5 rate=100.0%', flush=True)"
+            )
+            run_curriculum.stream_command(
+                [sys.executable, "-c", child_code], os.environ.copy(), root, log_path, False
+            )
+            stored = log_path.read_text(encoding="utf-8")
+            self.assertIn("[Checkpoint]", stored)
+            self.assertIn("[Curriculum Evaluation]", stored)
+            self.assertNotIn("[Training] run=", stored)
+            self.assertNotIn("[Evaluation Diagnostic]", stored)
 
     @unittest.skipUnless(os.name == "posix", "process-group shutdown test requires POSIX")
     def test_curriculum_tensorboard_cleanup_stops_owned_server(self):

@@ -22,6 +22,13 @@ import json
 import textwrap
 from collections import Counter, deque
 
+from important_logging import filter_persistent_log_text, should_flush_important_log, is_exception_end
+from curriculum_objectives import (
+    OBJECTIVE_DEFINITIONS,
+    ROUTE_101_MAP_ID, objective_satisfied as _objective_satisfied,
+    objective_start_error,
+)
+
 
 # Track environment provenance so the selected profile can replace stale mode settings
 # from older .env files while still respecting explicitly exported shell variables.
@@ -788,7 +795,6 @@ REQUIRE_TRAINING_START_STATE = os.environ.get(
 ).strip().lower() not in {"0", "false", "no", "off"}
 # Select a curriculum objective in .env; the shared recurrent policy architecture stays
 # the same as the agent progresses from the starter task to later story milestones.
-ROUTE_101_MAP_ID = 16  # BPEE mapGroup 0, mapNum 16; verified against the project's RAM telemetry.
 _configured_tensorboard_dir = os.environ.get("POKEMON_AI_TENSORBOARD_LOG_DIR", "tensorboard_logs_v2").strip()
 TENSORBOARD_LOG_DIR = (
     os.path.abspath(os.path.expanduser(_configured_tensorboard_dir))
@@ -869,6 +875,17 @@ MAX_SCREEN_NOVELTY_REWARD_PER_EPISODE = float(
 )
 PARTY_MEMBER_REWARD = float(os.environ.get("POKEMON_AI_PARTY_MEMBER_REWARD", "5.0"))
 TRAINER_WIN_REWARD = float(os.environ.get("POKEMON_AI_TRAINER_WIN_REWARD", "0.75"))
+# Pokémon EXP is encrypted in the Gen III party structure. Poll it at a low cadence and
+# grant a small shaping reward when EXP increases. This rewards progress after wild or trainer
+# Pokémon are defeated without treating entering a battle, catching a Pokémon, or running away
+# as a victory. It is an EXP-gain signal, not a perfect battle-outcome detector.
+BATTLE_EXP_REWARD_PER_100 = float(os.environ.get("POKEMON_AI_BATTLE_EXP_REWARD_PER_100", "0.10"))
+BATTLE_EXP_REWARD_CAP_PER_POLL = float(os.environ.get("POKEMON_AI_BATTLE_EXP_REWARD_CAP_PER_POLL", "0.50"))
+BATTLE_EXP_POLL_INTERVAL = int(os.environ.get("POKEMON_AI_BATTLE_EXP_POLL_INTERVAL", "8"))
+# Trainer-defeated flags are persistent in Emerald, so reading their full range every
+# policy decision is unnecessary. Poll periodically and reuse the cached set between polls.
+TRAINER_FLAG_POLL_INTERVAL = int(os.environ.get("POKEMON_AI_TRAINER_FLAG_POLL_INTERVAL", "8"))
+TIMING_DIAGNOSTICS = _env_flag("POKEMON_AI_TIMING_DIAGNOSTICS", False)
 LOOP_PENALTY = float(os.environ.get("POKEMON_AI_LOOP_PENALTY", "0.05"))
 LOOP_STAGNATION_STEPS = int(os.environ.get("POKEMON_AI_LOOP_STAGNATION_STEPS", "512"))
 LOOP_PENALTY_INTERVAL = int(os.environ.get("POKEMON_AI_LOOP_PENALTY_INTERVAL", "256"))
@@ -883,11 +900,17 @@ for _reward_name, _reward_value in {
     "MAX_SCREEN_NOVELTY_REWARD_PER_EPISODE": MAX_SCREEN_NOVELTY_REWARD_PER_EPISODE,
     "PARTY_MEMBER_REWARD": PARTY_MEMBER_REWARD,
     "TRAINER_WIN_REWARD": TRAINER_WIN_REWARD,
+    "BATTLE_EXP_REWARD_PER_100": BATTLE_EXP_REWARD_PER_100,
+    "BATTLE_EXP_REWARD_CAP_PER_POLL": BATTLE_EXP_REWARD_CAP_PER_POLL,
     "LOOP_PENALTY": LOOP_PENALTY,
     "TASK_SUCCESS_REWARD": TASK_SUCCESS_REWARD,
 }.items():
     if _reward_value < 0:
         raise ValueError(f"{_reward_name} must be >= 0")
+if BATTLE_EXP_POLL_INTERVAL < 1:
+    raise ValueError("POKEMON_AI_BATTLE_EXP_POLL_INTERVAL must be a positive integer")
+if TRAINER_FLAG_POLL_INTERVAL < 1:
+    raise ValueError("POKEMON_AI_TRAINER_FLAG_POLL_INTERVAL must be a positive integer")
 if LOOP_STAGNATION_STEPS < 1 or LOOP_PENALTY_INTERVAL < 1:
     raise ValueError("Loop-detection step settings must be positive integers")
 SAVE_BLOCK1_PTR_ADDRESS = 0x03005D8C
@@ -949,23 +972,9 @@ STATE_FEATURE_NAMES = (
 
 REWARD_COMPONENT_NAMES = (
     "step", "tile", "map", "screen", "story", "party", "level", "badge",
-    "trainer", "loop", "task_success",
+    "trainer", "battle_exp", "loop", "task_success",
 )
 
-OBJECTIVE_DEFINITIONS = {
-    "starter": {
-        "label": "first Pokémon",
-        "description": "Obtain a valid first Pokémon in the live party.",
-    },
-    "pokedex": {
-        "label": "Pokédex",
-        "description": "Have a party member and obtain the Pokédex flag.",
-    },
-    "first_badge": {
-        "label": "first Gym Badge",
-        "description": "Obtain at least one Gym Badge.",
-    },
-}
 OBJECTIVE_NAME = os.environ.get("POKEMON_AI_OBJECTIVE", "starter").strip().lower()
 if OBJECTIVE_NAME not in OBJECTIVE_DEFINITIONS:
     raise ValueError(
@@ -974,55 +983,23 @@ if OBJECTIVE_NAME not in OBJECTIVE_DEFINITIONS:
 OBJECTIVE_LABEL = OBJECTIVE_DEFINITIONS[OBJECTIVE_NAME]["label"]
 
 
-def _objective_satisfied(objective, state):
-    """Evaluate a named curriculum milestone; malformed telemetry never counts as success."""
-    if not isinstance(state, dict):
-        return False
-    objective = str(objective or OBJECTIVE_NAME).strip().lower()
-    if objective not in OBJECTIVE_DEFINITIONS:
-        raise ValueError(
-            f"Unknown objective {objective!r}; expected one of "
-            + ", ".join(OBJECTIVE_DEFINITIONS)
-        )
+def _decode_gen3_growth_words(personality, ot_id, encrypted_species_item, encrypted_experience):
+    """Decode the two encrypted Growth-substructure words needed for EXP reward shaping.
 
-    party_count_value = _finite_number(state.get("party_count", 0))
-    party_levels_value = _finite_number(state.get("party_levels", 0))
-    if (
-        party_count_value is None
-        or party_levels_value is None
-        or party_count_value < 0
-        or party_count_value > 6
-        or party_levels_value < 0
-        or party_levels_value > 600
-        or not party_count_value.is_integer()
-        or not party_levels_value.is_integer()
-    ):
-        return False
-    party_count = int(party_count_value)
-    party_levels = int(party_levels_value)
-
-    story_flags = state.get("story_flags", set())
-    if story_flags is None:
-        story_flags = set()
-    if not isinstance(story_flags, (set, frozenset, list, tuple, range)):
-        return False
-
-    badge_count_value = _finite_number(state.get("badge_count"))
-    if badge_count_value is None:
-        badge_flags_value = _finite_number(state.get("badge_flags", 0))
-        if badge_flags_value is None or badge_flags_value < 0 or not badge_flags_value.is_integer():
-            return False
-        badge_count_value = float(int(badge_flags_value).bit_count())
-    if badge_count_value < 0 or badge_count_value > 8 or not badge_count_value.is_integer():
-        return False
-
-    if objective == "starter":
-        return party_count >= 1 and party_levels >= 1
-    if objective == "pokedex":
-        return party_count >= 1 and POKEDEX_OBTAINED_FLAG_ID in story_flags
-    if objective == "first_badge":
-        return int(badge_count_value) >= 1
-    return False
+    Emerald encrypts each 32-bit word with personality XOR OT ID. The first word contains
+    species and held item; the second stores EXP. Reject implausible species/EXP to avoid
+    rewarding on an invalid pointer or a RAM read during emulator initialization.
+    """
+    try:
+        key = (int(personality) ^ int(ot_id)) & 0xFFFFFFFF
+        species_item = (int(encrypted_species_item) ^ key) & 0xFFFFFFFF
+        experience = (int(encrypted_experience) ^ key) & 0xFFFFFFFF
+        species = species_item & 0xFFFF
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (1 <= species <= 412 and 0 <= experience <= 2_000_000):
+        return None
+    return experience
 
 
 def _finite_number(value):
@@ -1115,7 +1092,7 @@ def _mini_episode_boundary_due(
         return False
     return bool(
         mode in {"train", "evaluate", "watch"}
-        and objective in {"pokedex", "first_badge"}
+        and objective in OBJECTIVE_DEFINITIONS and objective != "starter"
         and every > 0
         and step > 0
         and step % every == 0
@@ -1185,33 +1162,15 @@ def _training_start_validation_error(state, objective=None):
     if not badge_count.is_integer() or not 0 <= badge_count <= 8:
         return "badge count is outside the valid Emerald range"
 
-    if objective == "starter":
-        if map_id != ROUTE_101_MAP_ID:
-            return (
-                f"the starter task must start on Route 101 (map_id={ROUTE_101_MAP_ID}); "
-                f"the current map_id is {map_id}"
-            )
-        if CLOCK_SET_FLAG_ID not in story_flags:
-            return "the bedroom clock-set flag is absent; save after setting the clock"
-        if BIRCH_RESCUED_FLAG_ID in story_flags:
-            return "the starter task must start before rescuing Birch and before receiving a starter"
-        if party_count != 0:
-            return "the starter task must start before receiving a starter Pokémon"
-        if party_levels != 0:
-            return "the starter task must start with an empty party and no party levels"
-    elif objective == "pokedex":
-        if party_count < 1 or party_levels < 1:
-            return "the Pokédex stage must start from a verified state with a starter in the live party"
-        if _objective_satisfied(objective, state):
-            return "the Pokédex objective is already complete in this start state"
-    elif objective == "first_badge":
-        if party_count < 1 or party_levels < 1:
-            return "the first-badge stage must start with a valid Pokémon in the live party"
-        if POKEDEX_OBTAINED_FLAG_ID not in story_flags:
-            return "the first-badge stage requires a verified Pokédex milestone start state"
-        if int(badge_count) >= 1:
-            return "the first Gym Badge is already present in this start state"
-    return None
+    # The shared validator keeps direct training/evaluation and curriculum-stage
+    # prerequisites in sync. A state may already satisfy a later objective because
+    # Emerald advances a scripted transition automatically; in that case the task
+    # is allowed to complete immediately instead of rejecting a valid savestate.
+    return objective_start_error(
+        objective,
+        state,
+        route_101_map_id=ROUTE_101_MAP_ID,
+    )
 
 def _diminishing_novelty_reward(base_reward, prior_visits):
     """Decay novelty payoff as the same tile/map/screen is encountered across episodes."""
@@ -1328,18 +1287,24 @@ VIDEO_INTERMEDIATE_PATH = os.path.join(TEMP_DIR, _VIDEO_BASENAME + ".opencv.tmp.
 VIDEO_MUX_TEMP_PATH = os.path.join(TEMP_DIR, _VIDEO_BASENAME + ".mux.tmp.mp4")
 VIDEO_AUDIO_TEMP_PATH = os.path.join(TEMP_DIR, _VIDEO_BASENAME + ".audio.tmp.wav")
 # PPO transition count between periodic checkpoints. Override with POKEMON_AI_CHECKPOINT_EVERY.
-CHECKPOINT_SAVE_FREQUENCY = int(os.environ.get("POKEMON_AI_CHECKPOINT_EVERY", "25000"))
+# Default to a much less frequent checkpoint cadence. configure_training.py aligns this
+# with the active vector rollout; this fallback is for direct launch without the configurator.
+CHECKPOINT_SAVE_FREQUENCY = int(os.environ.get("POKEMON_AI_CHECKPOINT_EVERY", "122880"))
 CHECKPOINT_ARCHIVE_KEEP = int(os.environ.get("POKEMON_AI_CHECKPOINT_KEEP", "20"))
-PROGRESS_LOG_FREQUENCY = int(os.environ.get("POKEMON_AI_PROGRESS_EVERY", "1000"))
+LATEST_CHECKPOINT_BACKUP_ENABLED = _env_flag("POKEMON_AI_LATEST_BACKUP_ENABLED", True)
+PROGRESS_LOG_FREQUENCY = int(os.environ.get("POKEMON_AI_PROGRESS_EVERY", "5000"))
 if CHECKPOINT_SAVE_FREQUENCY < 1:
     raise ValueError("POKEMON_AI_CHECKPOINT_EVERY must be a positive integer")
 if CHECKPOINT_ARCHIVE_KEEP < 0:
     raise ValueError("POKEMON_AI_CHECKPOINT_KEEP must be >= 0 (0 disables rolling snapshots)")
 if PROGRESS_LOG_FREQUENCY < 1:
     raise ValueError("POKEMON_AI_PROGRESS_EVERY must be a positive integer")
-TERMINAL_PROGRESS_FREQUENCY = int(os.environ.get("POKEMON_AI_TERMINAL_PROGRESS_EVERY", "5000"))
+TERMINAL_PROGRESS_FREQUENCY = int(os.environ.get("POKEMON_AI_TERMINAL_PROGRESS_EVERY", "10000"))
 if TERMINAL_PROGRESS_FREQUENCY < 1:
     raise ValueError("POKEMON_AI_TERMINAL_PROGRESS_EVERY must be a positive integer")
+TERMINAL_EPISODE_EVERY = int(os.environ.get("POKEMON_AI_TERMINAL_EPISODE_EVERY", "50"))
+if TERMINAL_EPISODE_EVERY < 1:
+    raise ValueError("POKEMON_AI_TERMINAL_EPISODE_EVERY must be a positive integer")
 
 # Stopwatch Session Time Logging Configuration
 SESSION_LOG_PATH = os.path.join(LOG_DIR, "session_time_log.txt")
@@ -1355,6 +1320,15 @@ SAVE_BLOCK1_PARTY_COUNT_OFFSET = 0x234
 SAVE_BLOCK1_PARTY_OFFSET = 0x238
 PARTY_POKEMON_SIZE = 100  # sizeof(struct Pokemon) in the runtime SaveBlock1 party
 PARTY_LEVEL_OFFSET = 0x54
+PARTY_PERSONALITY_OFFSET = 0x00
+PARTY_OT_ID_OFFSET = 0x04
+PARTY_ENCRYPTED_BLOCK_OFFSET = 0x20
+GEN3_SUBSTRUCT_ORDERS = (
+    "GAEM", "GAME", "GEAM", "GEMA", "GMAE", "GMEA",
+    "AGEM", "AGME", "AEGM", "AEMG", "AMGE", "AMEG",
+    "EGAM", "EGMA", "EAGM", "EAMG", "EMGA", "EMAG",
+    "MGAE", "MGEA", "MAGE", "MAEG", "MEGA", "MEAG",
+)
 # FLAG_BADGE01_GET through FLAG_BADGE08_GET are 0x867..0x86E in standard Emerald.
 BADGE_FLAG_IDS = tuple(range(0x867, 0x86F))
 
@@ -1464,6 +1438,8 @@ tb_process = None
 tb_owned = False
 tb_log_handle = None
 STOP_REQUESTED = False
+LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP = None
+LAST_SUCCESSFUL_EMULATOR_SAVE_TIMESTEP = None
 
 
 class SessionTimer:
@@ -1627,6 +1603,9 @@ class MGBAAudioOutput:
         self.overruns = 0
         self.underruns = 0
         self.samples_drained = 0
+        # Reuse a native scratch array when headless audio is drained and discarded.
+        self._drain_scratch = None
+        self._drain_scratch_values = 0
         self.playback_sample_rate = 0
         self.record_wave = None
         self.recording_path = None
@@ -1766,24 +1745,39 @@ class MGBAAudioOutput:
         return self.record_wave is not None
 
     def drain(self, accept=True, record=False):
-        """Drain native samples; optionally record PCM and/or queue audible playback."""
+        """Drain native samples; avoid NumPy allocation when headless samples are discarded."""
         if self.buffer is None or self.ffi is None:
             return
         try:
             available = int(self.available_audio(self.buffer))
+            needs_python_samples = bool(
+                (record and self.record_wave is not None)
+                or (accept and self.output_active and not self.muted)
+            )
+            # Keep the reusable native scratch allocation bounded if the ring backs up.
+            max_frames_per_read = 4096
             while available > 0:
-                pcm = self.ffi.new("int16_t[]", available * self.channels)
-                count = int(self.read_audio(self.buffer, pcm, available))
+                frames_to_read = min(available, max_frames_per_read)
+                values_needed = frames_to_read * self.channels
+                if self._drain_scratch is None or self._drain_scratch_values < values_needed:
+                    self._drain_scratch = self.ffi.new("int16_t[]", values_needed)
+                    self._drain_scratch_values = values_needed
+                count = int(self.read_audio(self.buffer, self._drain_scratch, frames_to_read))
                 if count <= 0:
                     break
-                byte_count = count * self.channels * self.ffi.sizeof("int16_t")
-                samples = np.frombuffer(
-                    self.ffi.buffer(pcm, byte_count), dtype=np.int16
-                ).reshape(count, self.channels).copy()
+                available -= count
                 self.samples_drained += count
 
-                # Recorded audio is independent of speaker mute and GUI presence:
-                # muting should affect listening, not the saved video soundtrack.
+                # fast_train/headless: remove samples from mGBA's ring without creating
+                # a NumPy array or copying PCM that nobody will play or record.
+                if not needs_python_samples:
+                    continue
+
+                byte_count = count * self.channels * self.ffi.sizeof("int16_t")
+                samples = np.frombuffer(
+                    self.ffi.buffer(self._drain_scratch, byte_count), dtype=np.int16
+                ).reshape(count, self.channels).copy()
+
                 if record and self.record_wave is not None:
                     try:
                         self.record_wave.writeframesraw(
@@ -1868,12 +1862,13 @@ class MGBAAudioOutput:
 
 
 class _TeeStream:
-    """Mirror console output into a run log without changing the visible terminal output."""
+    """Show all console output, but persist only important events and final reports."""
 
     def __init__(self, console_stream, log_stream, lock):
         self.console_stream = console_stream
         self.log_stream = log_stream
         self.lock = lock
+        self._capturing_traceback = False
 
     @property
     def encoding(self):
@@ -1882,17 +1877,27 @@ class _TeeStream:
     def write(self, value):
         if not value:
             return 0
+        # Do not change interactive diagnostics: every message still appears on screen.
         self.console_stream.write(value)
         with self.lock:
-            self.log_stream.write(value)
+            if "Traceback (most recent call last)" in value:
+                self._capturing_traceback = True
+            if self._capturing_traceback:
+                persisted = value
+            else:
+                persisted = filter_persistent_log_text(value)
+            if persisted:
+                self.log_stream.write(persisted)
+                if should_flush_important_log(persisted):
+                    self.log_stream.flush()
+            if self._capturing_traceback and is_exception_end(value):
+                self._capturing_traceback = False
         return len(value)
 
     def flush(self):
-        try:
-            self.console_stream.flush()
-        finally:
-            with self.lock:
-                self.log_stream.flush()
+        # Console flushes are frequent because some prints use flush=True. Do not
+        # turn each one into a disk flush; selected important events flush in write().
+        self.console_stream.flush()
 
     def isatty(self):
         return bool(getattr(self.console_stream, "isatty", lambda: False)())
@@ -1940,7 +1945,12 @@ class EmeraldEnv(gym.Env):
         self._last_raw_frame_rgb = None
         self._memory_read_warning_printed = False
         self._consecutive_ram_read_failures = 0
+        # Known SaveBlock1 party-count mismatch signatures are logged once per worker,
+        # not once per short successful training episode.
         self._last_party_debug_signature = None
+        self._cached_trainer_flags = set()
+        self._training_success_logged_once = False
+        self._terminal_episode_count = 0
         # Full Gymnasium-episode metrics remain cumulative until true termination.
         self.visited_maps = set()
         self.visited_tiles = set()
@@ -1967,6 +1977,7 @@ class EmeraldEnv(gym.Env):
 
         # Tracking variables for reward shaping deltas
         self.prev_party_levels = 0
+        self.prev_party_experience = None
         self.prev_badges = 0
         self.prev_caught_count = 0
         self.prev_map_id = None
@@ -2825,7 +2836,44 @@ class EmeraldEnv(gym.Env):
                     found.add(flag_id)
         return found
 
-    def _read_game_state(self):
+    def _read_party_experience(self, party_count):
+        """Read total party EXP cheaply, decoding only the encrypted Growth words.
+
+        This is polled every few policy decisions rather than every frame/step, limiting RAM
+        inspection overhead. `None` indicates invalid/unavailable telemetry.
+        """
+        try:
+            party_count = int(party_count)
+            if not 0 <= party_count <= 6:
+                return None
+            total = 0
+            for index in range(party_count):
+                mon_base = PLAYER_PARTY_ADDRESS + index * PARTY_POKEMON_SIZE
+                personality = self._read32(mon_base + PARTY_PERSONALITY_OFFSET)
+                ot_id = self._read32(mon_base + PARTY_OT_ID_OFFSET)
+                order = GEN3_SUBSTRUCT_ORDERS[personality % 24]
+                growth_base = mon_base + PARTY_ENCRYPTED_BLOCK_OFFSET + order.index("G") * 12
+                encrypted_species_item = self._read32(growth_base)
+                encrypted_experience = self._read32(growth_base + 4)
+                experience = _decode_gen3_growth_words(
+                    personality, ot_id, encrypted_species_item, encrypted_experience
+                )
+                if experience is None:
+                    return None
+                total += experience
+            return total
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+    def _party_debug_signature_changed(self, signature):
+        """Return True only when a live-vs-SaveBlock mismatch changes."""
+        previous = getattr(self, "_last_party_debug_signature", None)
+        if signature == previous:
+            return False
+        self._last_party_debug_signature = signature
+        return True
+
+    def _read_game_state(self, include_trainer_flags=True):
         """Read party, badges, map, coordinates and story flags for Emerald BPEE."""
         saveblock1_ptr = self._read_saveblock1_pointer()
         if saveblock1_ptr is None:
@@ -2868,7 +2916,13 @@ class EmeraldEnv(gym.Env):
             map_id = -1
         player_x, player_y = self._read_player_position(saveblock1_ptr)
         story_flags = self._read_story_flags(saveblock1_ptr)
-        trainer_flags = self._read_trainer_flags(saveblock1_ptr)
+        if include_trainer_flags or not hasattr(self, "_cached_trainer_flags"):
+            trainer_flags = self._read_trainer_flags(saveblock1_ptr)
+            self._cached_trainer_flags = set(trainer_flags)
+        else:
+            # Read-only consumers use this set without mutation; reusing it avoids a
+            # new Python set allocation on every non-polling action.
+            trainer_flags = self._cached_trainer_flags
         return {
             "party_count": party_count,
             "party_levels": total_party_levels,
@@ -2890,6 +2944,7 @@ class EmeraldEnv(gym.Env):
         try:
             state = self._read_game_state()
             self.prev_party_levels = state["party_levels"]
+            self.prev_party_experience = self._read_party_experience(state["party_count"])
             self.prev_badges = state["badge_flags"]
             self.prev_caught_count = state["party_count"]
             self.prev_map_id = state["map_id"]
@@ -2951,7 +3006,8 @@ class EmeraldEnv(gym.Env):
             self._last_game_state = None
             self._task_success_rewarded = False
             self._consecutive_ram_read_failures = 0
-            self._last_party_debug_signature = None
+            # Keep _last_party_debug_signature across episodes. A static SaveBlock/live
+            # mismatch should be reported once per worker, not again after every reset.
 
             if self.stop_requested or STOP_REQUESTED:
                 obs = self._get_obs()
@@ -3071,6 +3127,9 @@ class EmeraldEnv(gym.Env):
         finally:
             faulthandler.cancel_dump_traceback_later()
     def step(self, action):
+        timing_enabled = bool(TIMING_DIAGNOSTICS and MODE == "train")
+        step_started = time.perf_counter() if timing_enabled else 0.0
+        frame_elapsed = image_elapsed = state_elapsed = observation_elapsed = 0.0
         if self.stop_requested or STOP_REQUESTED:
             self.stop_requested = True
             return self._get_obs(), 0.0, False, True, {
@@ -3106,7 +3165,7 @@ class EmeraldEnv(gym.Env):
             for frame_action, frame_count in ((action, max(1, ACTION_REPEAT)), (None, ACTION_RELEASE_FRAMES)):
                 for _ in range(frame_count):
                     self._set_action_keys(frame_action)
-                    frame_started = time.perf_counter()
+                    frame_started = time.perf_counter() if (timing_enabled or GUI_MODE or WATCH_FPS_CAP > 0) else 0.0
                     run_frame()
                     self._pump_audio_buffer(
                         accept=self._audio_accepting,
@@ -3121,6 +3180,8 @@ class EmeraldEnv(gym.Env):
                         delay = (1.0 / WATCH_FPS_CAP) - (time.perf_counter() - frame_started)
                         if delay > 0:
                             time.sleep(delay)
+                    if timing_enabled:
+                        frame_elapsed += time.perf_counter() - frame_started
                 if self.stop_requested or STOP_REQUESTED:
                     break
             self._set_action_keys(None)
@@ -3159,8 +3220,11 @@ class EmeraldEnv(gym.Env):
 
         # Read one screenshot for both generic visual novelty and the policy observation.
         # This path runs even in headless mode; GUI_MODE only controls displaying the frame.
+        image_started = time.perf_counter() if timing_enabled else 0.0
         screen_frame = self._get_image_obs() if self.core is not None else None
         current_screen_signature = _screen_signature(screen_frame)
+        if timing_enabled:
+            image_elapsed = time.perf_counter() - image_started
         state = None
         component = {name: 0.0 for name in REWARD_COMPONENT_NAMES}
         component["step"] = -STEP_PENALTY
@@ -3178,8 +3242,13 @@ class EmeraldEnv(gym.Env):
         if current_screen_signature is not None:
             self.screen_signature_history.append(current_screen_signature)
         if self.core is not None:
+            state_started = time.perf_counter() if timing_enabled else 0.0
             try:
-                state = self._read_game_state()
+                poll_trainer_flags = (
+                    self.episode_step_counter % TRAINER_FLAG_POLL_INTERVAL == 0
+                    or not hasattr(self, "_cached_trainer_flags")
+                )
+                state = self._read_game_state(include_trainer_flags=poll_trainer_flags)
                 self._last_game_state = state
 
                 # Keep stale SaveBlock party data visible for diagnostics, but never use it
@@ -3187,21 +3256,46 @@ class EmeraldEnv(gym.Env):
                 live_party_count = int(state["party_count"])
                 saved_party_count = int(state["party_count_saveblock1"])
                 starter_flag_set = STARTER_OBTAINED_FLAG_ID in state.get("story_flags", set())
+
+                # A small reward for actual party EXP gain encourages defeating wild Pokémon
+                # even when the EXP gain is too small to trigger a level-up. Party count must
+                # remain stable across samples, so receiving/catching a new Pokémon is not
+                # misclassified as battle EXP. This is a progress proxy, not a battle-screen
+                # or gBattleOutcome detector; trainer victories still use trainer flags below.
+                experience_delta = 0
+                if self.episode_step_counter % BATTLE_EXP_POLL_INTERVAL == 0:
+                    current_party_experience = self._read_party_experience(live_party_count)
+                    previous_party_experience = getattr(self, "prev_party_experience", None)
+                    if current_party_experience is not None:
+                        if (
+                            previous_party_experience is not None
+                            and live_party_count == int(getattr(self, "prev_caught_count", live_party_count))
+                            and current_party_experience > previous_party_experience
+                        ):
+                            experience_delta = current_party_experience - previous_party_experience
+                            component["battle_exp"] = min(
+                                BATTLE_EXP_REWARD_CAP_PER_POLL,
+                                experience_delta * BATTLE_EXP_REWARD_PER_100 / 100.0,
+                            )
+                        self.prev_party_experience = current_party_experience
+                    else:
+                        # Re-establish a clean baseline after invalid/transient RAM telemetry.
+                        self.prev_party_experience = None
                 if live_party_count != saved_party_count:
                     party_signature = (
                         live_party_count, saved_party_count, int(state["party_levels"]),
                         tuple(state.get("party_slot_levels", ())), starter_flag_set,
                     )
-                    if party_signature != self._last_party_debug_signature:
+                    if self._party_debug_signature_changed(party_signature):
                         party_rows = [
                             ("Authority", "live gPlayerPartyCount (SaveBlock1 is diagnostic only)"),
                             ("Party count", f"live={live_party_count} | SaveBlock1={saved_party_count}"),
                             ("Pokémon levels", f"slots={list(state.get('party_slot_levels', ()))!r} | total={state['party_levels']}"),
                             ("Starter flag", str(starter_flag_set)),
                         ]
-                        print("\n" + _format_progress_table("PARTY RAM CONSISTENCY WARNING", party_rows, width=None), flush=True)
-                    self._last_party_debug_signature = party_signature
+                        print("\n" + _format_progress_table("PARTY RAM DIAGNOSTIC — LIVE COUNT IS AUTHORITATIVE", party_rows, width=None), flush=True)
                 else:
+                    # If the mismatch clears, a later recurrence should be reported again.
                     self._last_party_debug_signature = None
 
                 # Level/party progress is delta-based and cannot be farmed by standing still.
@@ -3334,8 +3428,18 @@ class EmeraldEnv(gym.Env):
                         ("Badges", str(state.get("badge_count", 0))),
                         ("Location", f"map={state.get('map_id', -1)} | pos=({state.get('player_x', -1)},{state.get('player_y', -1)})"),
                     ]
-                    print("\n" + _format_progress_table("OBJECTIVE COMPLETED", success_rows, width=None), flush=True)
-                    self._save_objective_milestone(state)
+                    # During training the same short objective episode may succeed hundreds
+                    # of times. Print only the first such table per worker; evaluation keeps
+                    # per-episode detail because its small episode count is diagnostically useful.
+                    if MODE != "train" or not self._training_success_logged_once:
+                        print("\n" + _format_progress_table("OBJECTIVE COMPLETED", success_rows, width=None), flush=True)
+                        if MODE == "train":
+                            self._training_success_logged_once = True
+                    # The curriculum requires a fresh, checkpoint-linked milestone from its
+                    # evaluation process. Re-saving a ~400 KB savestate on every training
+                    # success adds unnecessary I/O and floods the logs, so training defers it.
+                    if MODE != "train":
+                        self._save_objective_milestone(state)
                     if MODE == "watch":
                         try:
                             send_notification(
@@ -3394,6 +3498,8 @@ class EmeraldEnv(gym.Env):
                     "story_reward": component["story"],
                     "party_reward": component["party"],
                     "trainer_reward": component["trainer"],
+                    "battle_exp_reward": component["battle_exp"],
+                    "party_experience_delta": int(experience_delta),
                     "loop_penalty": component["loop"],
                     "task_success_reward": component["task_success"],
                 })
@@ -3421,6 +3527,9 @@ class EmeraldEnv(gym.Env):
                 info["ram_read_failed"] = True
                 info["ram_read_failures_consecutive"] = self._consecutive_ram_read_failures
                 self._last_game_state = None
+            finally:
+                if timing_enabled:
+                    state_elapsed = time.perf_counter() - state_started
 
         will_truncate_at_limit = _episode_time_limit_reached(MODE, self.episode_step_counter)
         mini_boundary_due = _mini_episode_boundary_due(
@@ -3478,7 +3587,10 @@ class EmeraldEnv(gym.Env):
         info["episode_reward_total_so_far"] = float(sum(self.episode_reward_components.values()))
 
         # The next observation sees the updated visited-tile map and decoded state.
+        observation_started = time.perf_counter() if timing_enabled else 0.0
         obs = self._get_obs(game_state=state, read_state=False, screen=screen_frame)
+        if timing_enabled:
+            observation_elapsed = time.perf_counter() - observation_started
 
         # Record frame if enabled
         if self.video_writer is not None and self._last_raw_frame_rgb is not None:
@@ -3518,7 +3630,26 @@ class EmeraldEnv(gym.Env):
                 ("Game state", f"map={info.get('map_id', -1)} | pos=({info.get('player_x', -1)},{info.get('player_y', -1)}) | party={info.get('party_count', '?')} | levels={info.get('party_levels', '?')} | badges={info.get('badge_count', '?')}"),
                 ("Reward breakdown", reward_breakdown),
             ]
-            print("\n" + _format_progress_table(f"EPISODE FINISHED — ENV {self.env_id}", episode_rows, width=None), flush=True)
+            self._terminal_episode_count += 1
+            should_log_episode = (
+                MODE != "train"
+                or outcome != "SUCCESS"
+                or self._terminal_episode_count == 1
+                or self._terminal_episode_count % TERMINAL_EPISODE_EVERY == 0
+            )
+            if should_log_episode:
+                print("\n" + _format_progress_table(
+                    f"EPISODE FINISHED — ENV {self.env_id} — #{self._terminal_episode_count}",
+                    episode_rows, width=None
+                ), flush=True)
+        if timing_enabled:
+            info.update({
+                "timing_env_ms": (time.perf_counter() - step_started) * 1000.0,
+                "timing_frames_ms": frame_elapsed * 1000.0,
+                "timing_image_ms": image_elapsed * 1000.0,
+                "timing_state_ms": state_elapsed * 1000.0,
+                "timing_obs_ms": observation_elapsed * 1000.0,
+            })
         return obs, float(reward), terminated, truncated, info
 
 
@@ -3912,11 +4043,33 @@ def atomic_save_model(model, checkpoint_base=MODEL_CHECKPOINT):
         with open(temp_path, "rb") as f:
             os.fsync(f.fileno())
 
-        if os.path.isfile(final_path):
+        if os.path.isfile(final_path) and LATEST_CHECKPOINT_BACKUP_ENABLED:
+            # Same-filesystem hard links make a previous-checkpoint backup effectively metadata-only.
+            # Fall back to a copy on filesystems that do not support hard links.
             backup_path = final_path + ".bak"
-            shutil.copy2(final_path, backup_path)
+            backup_temp = f"{backup_path}.tmp-{os.getpid()}-{time.time_ns()}"
+            try:
+                try:
+                    os.link(final_path, backup_temp)
+                except OSError:
+                    shutil.copy2(final_path, backup_temp)
+                if not os.path.isfile(backup_temp) or os.path.getsize(backup_temp) != os.path.getsize(final_path):
+                    raise IOError("Previous-checkpoint backup failed size validation")
+                os.replace(backup_temp, backup_path)
+                _fsync_parent_dir(backup_path)
+            finally:
+                try:
+                    if os.path.exists(backup_temp):
+                        os.remove(backup_temp)
+                except OSError:
+                    pass
         os.replace(temp_path, final_path)
         _fsync_parent_dir(final_path)
+        global LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP
+        try:
+            LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP = int(getattr(model, "num_timesteps", -1))
+        except (TypeError, ValueError, OverflowError):
+            LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP = None
         return final_path
     except Exception:
         # Keep the previous final checkpoint untouched. Remove only our known temp path.
@@ -3929,10 +4082,11 @@ def atomic_save_model(model, checkpoint_base=MODEL_CHECKPOINT):
 
 
 def archive_model_checkpoint(saved_model_path, timestep):
-    """Keep a bounded rolling archive of verified model checkpoints, without touching the latest.
+    """Keep a bounded rolling archive of verified immutable model checkpoints.
 
-    The latest checkpoint is saved first by atomic_save_model(). Each archive copy is also
-    staged and atomically published. A retention value of zero disables snapshots entirely.
+    The latest checkpoint is saved first by atomic_save_model(). Archive snapshots are hard
+    links where supported (otherwise file copies), then atomically published. A retention
+    value of zero disables rolling snapshots entirely.
     """
     if CHECKPOINT_ARCHIVE_KEEP == 0:
         return None
@@ -3957,7 +4111,13 @@ def archive_model_checkpoint(saved_model_path, timestep):
 
     temporary = destination + f".tmp-{os.getpid()}-{time.time_ns()}"
     try:
-        shutil.copy2(saved_model_path, temporary)
+        # Checkpoint archives are immutable snapshots. A hard link preserves the exact old
+        # inode when the current checkpoint is later atomically replaced, avoiding a full
+        # model-sized copy on normal same-filesystem Linux installations.
+        try:
+            os.link(saved_model_path, temporary)
+        except OSError:
+            shutil.copy2(saved_model_path, temporary)
         if (
             not os.path.isfile(temporary)
             or os.path.getsize(temporary) != os.path.getsize(saved_model_path)
@@ -4022,10 +4182,11 @@ def start_tensorboard():
             f"on {actual_port} for the current log directory.", flush=True,
         )
 
-    tb_log_path = os.path.join(LOG_DIR, "tensorboard_server.log")
-    os.makedirs(os.path.dirname(tb_log_path), exist_ok=True)
     try:
-        tb_log_handle = open(tb_log_path, "a", encoding="utf-8", buffering=1)
+        # TensorBoard's verbose server output is not useful for routine runs and can
+        # grow a second log indefinitely. Keep its chatter off disk; startup failures
+        # are still detected below and reported by this process.
+        tb_log_handle = None
         tb_process = subprocess.Popen(
             [
                 sys.executable, "-m", "tensorboard.main",
@@ -4033,19 +4194,19 @@ def start_tensorboard():
                 f"--port={actual_port}",
                 "--host=127.0.0.1",
             ],
-            stdout=tb_log_handle,
-            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         tb_owned = True
         time.sleep(0.5)
         if tb_process.poll() is not None:
             print(
-                f"[TensorBoard Warning] Server exited during startup; inspect {tb_log_path}.",
+                "[TensorBoard Warning] Server exited during startup; check TensorBoard installation, log directory, and port.",
                 flush=True,
             )
         else:
             print(f"[TensorBoard] Starting at http://127.0.0.1:{actual_port} | logdir={TENSORBOARD_LOG_DIR}", flush=True)
-            print(f"[TensorBoard] Server log: {tb_log_path}", flush=True)
     except Exception as exc:
         print(f"[TensorBoard Warning] Could not start TensorBoard: {exc}", flush=True)
         if tb_log_handle is not None:
@@ -4108,7 +4269,9 @@ class StopAndCheckpointCallback(BaseCallback):
         self._recent_actions = deque(maxlen=4096)  # actions actually sampled by PPO
         self._recent_greedy_actions = deque(maxlen=512)  # argmax actions on sampled training observations
         self._last_greedy_probe_timestep = 0
-        self._greedy_probe_interval = max(1, self.progress_frequency // 8)
+        # Greedy diagnostics run an extra CNN/LSTM inference. One probe per rollout is
+        # enough for collapse monitoring and avoids repeating inference every ~625 steps.
+        self._greedy_probe_interval = max(0, int(os.environ.get("POKEMON_AI_GREEDY_PROBE_EVERY", "8192")))
         self._greedy_probe_failures = 0
         self._last_collapse_warning_timestep = -1
         self._last_step_reward = 0.0
@@ -4129,6 +4292,8 @@ class StopAndCheckpointCallback(BaseCallback):
         }
         self._task_successes = 0
         self._timeouts = 0
+        self._timing_sums = Counter()
+        self._timing_samples = 0
 
     def _on_training_start(self):
         # On resumed training, num_timesteps can already be very large. Anchor the
@@ -4212,6 +4377,8 @@ class StopAndCheckpointCallback(BaseCallback):
     def _probe_greedy_actions(self):
         """Sample deterministic argmax choices on real rollout observations without changing rollout state."""
         timestep = int(self.num_timesteps)
+        if self._greedy_probe_interval <= 0:
+            return
         if timestep - self._last_greedy_probe_timestep < self._greedy_probe_interval:
             return
         observations = self.locals.get("new_obs")
@@ -4269,6 +4436,19 @@ class StopAndCheckpointCallback(BaseCallback):
 
         infos = self.locals.get("infos", [])
         infos_list = infos if isinstance(infos, (list, tuple)) else []
+        if TIMING_DIAGNOSTICS:
+            for info in infos_list:
+                if not isinstance(info, dict):
+                    continue
+                for timing_key in (
+                    "timing_env_ms", "timing_frames_ms", "timing_image_ms",
+                    "timing_state_ms", "timing_obs_ms",
+                ):
+                    timing_value = _finite_number(info.get(timing_key))
+                    if timing_value is not None and timing_value >= 0:
+                        self._timing_sums[timing_key] += timing_value
+                if "timing_env_ms" in info:
+                    self._timing_samples += 1
 
         # Treat episode aggregates as terminal-only data. Per-step component sums are
         # cumulative within an episode and must never be sampled as if they were final.
@@ -4331,7 +4511,7 @@ class StopAndCheckpointCallback(BaseCallback):
         component_short_names = {
             "step": "step", "tile": "tile", "map": "map", "screen": "screen",
             "story": "story", "party": "party", "level": "level", "badge": "badge",
-            "trainer": "trainer", "loop": "loop", "task_success": "task",
+            "trainer": "trainer", "battle_exp": "bexp", "loop": "loop", "task_success": "task",
         }
         for component_name, values in self._recent_episode_component_sums.items():
             short_name = component_short_names.get(component_name, component_name[:8])
@@ -4365,6 +4545,7 @@ class StopAndCheckpointCallback(BaseCallback):
             ("story_reward", "progress/story_reward"),
             ("party_reward", "progress/party_reward"),
             ("trainer_reward", "progress/trainer_reward"),
+            ("battle_exp_reward", "progress/battle_exp_reward"),
             ("loop_penalty", "progress/loop_penalty"),
             ("task_success_reward", "progress/task_success_reward"),
         )
@@ -4393,7 +4574,8 @@ class StopAndCheckpointCallback(BaseCallback):
                 self.logger.record(tb_key, float(sum(value for _, value in pairs)))
 
         # High-water marks survive per-episode autoresets and curriculum child processes.
-        # `party_count` below remains the current maximum; `*_peak` charts are persistent.
+        # Current party values can be zero immediately after a successful episode resets;
+        # *_peak charts preserve the best observed progress across those resets.
         for info_key, peak_key in (("party_count", "party_count"),
                                    ("party_levels", "party_total_levels"),
                                    ("badge_count", "badge_count")):
@@ -4547,8 +4729,8 @@ class StopAndCheckpointCallback(BaseCallback):
                 f"max={int(max(party_values))}, mean={np.mean(party_values):.2f}/env"
                 if party_values else "telemetry unavailable"
             )
-            level_summary = f"max={int(max(level_values))}" if level_values else "n/a"
-            badge_summary = f"max={int(max(badge_values))}" if badge_values else "n/a"
+            level_summary = str(int(max(level_values))) if level_values else "n/a"
+            badge_summary = str(int(max(badge_values))) if badge_values else "n/a"
             worker_state_parts = []
             for env_index, info in enumerate(infos_for_state):
                 if not info:
@@ -4587,6 +4769,7 @@ class StopAndCheckpointCallback(BaseCallback):
                 ("tile_reward", "tile"), ("map_reward", "map"), ("screen_reward", "screen"),
                 ("story_reward", "story"), ("party_reward", "party"), ("level_reward", "level"),
                 ("badge_reward", "badge"), ("trainer_reward", "trainer"),
+                ("battle_exp_reward", "battle EXP"),
                 ("loop_penalty", "loop"), ("task_success_reward", "task"),
             )
             component_parts = []
@@ -4596,6 +4779,25 @@ class StopAndCheckpointCallback(BaseCallback):
                     component_parts.append(f"{label}={np.mean([value for _, value in pairs]):+.3f}")
             reward_component_text = " | ".join(component_parts) or "not available"
 
+            timing_row = None
+            if TIMING_DIAGNOSTICS and self._timing_samples:
+                timing_labels = (
+                    ("timing_env_ms", "env"),
+                    ("timing_frames_ms", "frames+audio"),
+                    ("timing_image_ms", "image+signature"),
+                    ("timing_state_ms", "RAM+reward"),
+                    ("timing_obs_ms", "observation encode"),
+                )
+                timing_parts = []
+                for timing_key, label in timing_labels:
+                    average_ms = self._timing_sums.get(timing_key, 0.0) / self._timing_samples
+                    timing_parts.append(f"{label}={average_ms:.2f}ms")
+                    metric_name = timing_key.removeprefix("timing_").removesuffix("_ms")
+                    self.logger.record(f"timing/{metric_name}", float(average_ms))
+                timing_row = ("Step timing (worker mean)", " | ".join(timing_parts))
+                self._timing_sums.clear()
+                self._timing_samples = 0
+
             rows = [
                 ("Objective", f"{OBJECTIVE_LABEL} | mode={'GUI' if GUI_MODE else 'HEADLESS'} | action={action_text}"),
                 ("Progress", f"{run_transitions:,} / {run_target:,} transitions ({progress_percent:.2f}%) | global timestep={int(self.num_timesteps):,}"),
@@ -4603,7 +4805,7 @@ class StopAndCheckpointCallback(BaseCallback):
                 ("Speed", f"{steps_per_second:.1f} transitions/s total | {per_env_speed:.1f}/env/s | ~{aggregate_gba_fps:.0f} GBA frames/s aggregate"),
                 ("Workers", f"{worker_status} | configured environments={env_count} | action repeat={ACTION_REPEAT}+{ACTION_RELEASE_FRAMES} release frame(s)"),
                 ("Episodes", f"{episode_summary} | last episode: {last_episode_text}"),
-                ("Party / badges", f"party count {party_summary} | total party levels max={level_summary} | badges max={badge_summary}"),
+                ("Current party / badges", f"party count {party_summary} | total party levels max={level_summary} | badges max={badge_summary}"),
                 ("RAM health", f"party telemetry={len(party_values)}/{env_count} workers | live-vs-SaveBlock mismatches={mismatch_count if comparable_party_envs else 'n/a'}"),
                 ("Worker game state", worker_state_text),
                 ("Reward summary", f"last vector-step mean={self._last_step_reward:+.4f} | recent transition mean={recent_reward:+.4f} | live episode return mean={live_episode_reward_mean:+.2f} [{live_values}]"),
@@ -4619,6 +4821,8 @@ class StopAndCheckpointCallback(BaseCallback):
                  f"starter ever={bool(self._peak_metrics['starter_seen'])} | "
                  f"Pokédex ever={bool(self._peak_metrics['pokedex_seen'])}"),
             ]
+            if timing_row is not None:
+                rows.append(timing_row)
             if int(self.num_timesteps) - self._last_terminal_progress_timestep >= self.terminal_progress_frequency:
                 print("\n" + _format_progress_table(
                     f"POKÉMON EMERALD RL — TRAINING PROGRESS — {run_transitions:,}/{run_target:,}", rows
@@ -4668,6 +4872,8 @@ class StopAndCheckpointCallback(BaseCallback):
                     print(f"[Checkpoint Archive Warning] Latest checkpoint is safe; snapshot failed: {exc}", flush=True)
                 try:
                     self.training_env.env_method("save_state")
+                    global LAST_SUCCESSFUL_EMULATOR_SAVE_TIMESTEP
+                    LAST_SUCCESSFUL_EMULATOR_SAVE_TIMESTEP = checkpoint_timestep
                     print(
                         f"[Checkpoint] Emulator savestate(s) saved at timestep {checkpoint_timestep:,}.",
                         flush=True,
@@ -4834,14 +5040,19 @@ def _make_env(env_id):
     return _init
 
 
-def _save_vector_env_state(vec_env):
-    """Save each environment to its own path; worker paths are distinct in parallel mode."""
+def _save_vector_env_state(vec_env, timestep=None):
+    """Save each environment once at a checkpoint/shutdown boundary."""
+    global LAST_SUCCESSFUL_EMULATOR_SAVE_TIMESTEP
     if vec_env is None:
-        return
+        return False
     try:
         vec_env.env_method("save_state")
+        if timestep is not None and int(timestep) >= 0:
+            LAST_SUCCESSFUL_EMULATOR_SAVE_TIMESTEP = int(timestep)
+        return True
     except Exception as exc:
         print(f"[State Warning] Could not save all emulator states through vector environment: {exc}", flush=True)
+        return False
 
 
 def _shutdown_tensorboard():
@@ -4872,12 +5083,12 @@ def _shutdown_tensorboard():
 def _enable_run_log():
     os.makedirs(LOG_DIR, exist_ok=True)
     path = os.path.join(LOG_DIR, f"run_{TIMESTAMP_STR}.log")
-    log_handle = open(path, "a", encoding="utf-8", buffering=1)
+    log_handle = open(path, "a", encoding="utf-8", buffering=65536)
     lock = threading.RLock()
     old_stdout, old_stderr = sys.stdout, sys.stderr
     sys.stdout = _TeeStream(old_stdout, log_handle, lock)
     sys.stderr = _TeeStream(old_stderr, log_handle, lock)
-    print(f"[Log] Mirroring console output to {path}", flush=True)
+    print(f"[Log] Important events and finished reports only: {path} (routine progress tables omitted)", flush=True)
     return log_handle, old_stdout, old_stderr
 
 
@@ -4985,17 +5196,27 @@ if __name__ == "__main__":
                 # Retained as a fallback; the signal handler normally sets STOP_REQUESTED instead.
                 print("[Interrupt] KeyboardInterrupt received during training.")
             finally:
-                try:
-                    saved_model = atomic_save_model(model, MODEL_CHECKPOINT)
-                    print(f"[Save] PPO model checkpoint atomically saved to {saved_model}", flush=True)
+                final_timestep = int(getattr(model, "num_timesteps", 0))
+                if (
+                    LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP == final_timestep
+                    and os.path.isfile(f"{MODEL_CHECKPOINT}.zip")
+                ):
+                    print(
+                        f"[Save] Skipping duplicate final model/archive save; timestep {final_timestep:,} "
+                        "is already checkpointed.", flush=True
+                    )
+                else:
                     try:
-                        archived_model = archive_model_checkpoint(saved_model, int(getattr(model, "num_timesteps", 0)))
-                        if archived_model:
-                            print(f"[Checkpoint Archive] Preserved final snapshot: {archived_model}", flush=True)
-                    except Exception as archive_exc:
-                        print(f"[Checkpoint Archive Warning] Latest checkpoint is safe; final snapshot failed: {archive_exc}", flush=True)
-                except Exception as e:
-                    print(f"[Save Error] Could not save PPO model checkpoint: {e}")
+                        saved_model = atomic_save_model(model, MODEL_CHECKPOINT)
+                        print(f"[Save] PPO model checkpoint atomically saved to {saved_model}", flush=True)
+                        try:
+                            archived_model = archive_model_checkpoint(saved_model, final_timestep)
+                            if archived_model:
+                                print(f"[Checkpoint Archive] Preserved final snapshot: {archived_model}", flush=True)
+                        except Exception as archive_exc:
+                            print(f"[Checkpoint Archive Warning] Latest checkpoint is safe; final snapshot failed: {archive_exc}", flush=True)
+                    except Exception as e:
+                        print(f"[Save Error] Could not save PPO model checkpoint: {e}")
 
             if STOP_REQUESTED:
                 print("[Stopped] Training stopped by user request; checkpoint saved.")
@@ -5460,7 +5681,15 @@ if __name__ == "__main__":
     finally:
         # Save runtime session stopwatch log
         if env is not None:
-            _save_vector_env_state(env)
+            current_model = locals().get("model")
+            current_timestep = int(getattr(current_model, "num_timesteps", -1)) if current_model is not None else -1
+            if current_timestep >= 0 and LAST_SUCCESSFUL_EMULATOR_SAVE_TIMESTEP == current_timestep:
+                print(
+                    f"[Save] Skipping duplicate shutdown emulator savestate; timestep {current_timestep:,} "
+                    "was already saved.", flush=True
+                )
+            else:
+                _save_vector_env_state(env, timestep=current_timestep)
             try:
                 env.close()
             except Exception as e:

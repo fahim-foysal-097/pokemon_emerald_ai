@@ -5,9 +5,10 @@ Uses only the Python standard library. Run from the project's virtualenv:
     ./.venv/bin/python run_curriculum.py --dry-run
     ./.venv/bin/python run_curriculum.py
 
-The manager starts by evaluating an existing checkpoint before spending training time.
-It promotes only after the configured fixed-seed evaluation threshold is reached and
-both the objective savestate and its metadata manifest exist.
+Normal mode evaluates an existing checkpoint and promotes only after a verified
+fixed-seed objective evaluation. Stage-only mode (--stage-only or
+POKEMON_AI_CURRICULUM_STAGE_ONLY=1) trains one selected stage for the configured
+number of chunks without evaluating, comparing checkpoints, or promoting.
 """
 from __future__ import annotations
 
@@ -29,12 +30,9 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-STAGES = ("starter", "pokedex", "first_badge")
-OBJECTIVE_LABELS = {
-    "starter": "first Pokémon",
-    "pokedex": "Pokédex",
-    "first_badge": "first Gym Badge",
-}
+from important_logging import filter_persistent_log_text, is_important_log_line, should_flush_important_log, is_exception_end
+from curriculum_objectives import CURRICULUM_PLAN_ID, OBJECTIVE_LABELS, STAGES
+
 
 # Only terminate processes created by this curriculum invocation. Existing servers
 # owned by the user are never claimed or killed.
@@ -68,6 +66,11 @@ def parse_dotenv(path: Path) -> dict[str, str]:
 def bool_setting(values: dict[str, str], key: str, default: bool) -> bool:
     value = os.environ.get(key, values.get(key, "1" if default else "0"))
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def stage_only_requested(cli_enabled: bool, values: dict[str, str]) -> bool:
+    """Stage-only mode is enabled by CLI or .env/shell; it never promotes or evaluates."""
+    return bool(cli_enabled or bool_setting(values, "POKEMON_AI_CURRICULUM_STAGE_ONLY", False))
 
 
 def int_setting(values: dict[str, str], key: str, default: int, minimum: int = 1) -> int:
@@ -333,7 +336,7 @@ def stop_managed_process(
 def stream_command(command: list[str], env: dict[str, str], cwd: Path, log_path: Path, dry_run: bool) -> None:
     printable = " ".join(shlex.quote(part) for part in command)
     print(f"\n[Curriculum] $ {printable}", flush=True)
-    print(f"[Curriculum] log: {log_path}", flush=True)
+    print(f"[Curriculum] concise event log: {log_path} (routine progress output omitted)", flush=True)
     if dry_run:
         return
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -346,19 +349,33 @@ def stream_command(command: list[str], env: dict[str, str], cwd: Path, log_path:
         stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True,
     )
     assert child.stdout is not None
-    with log_path.open("a", encoding="utf-8", buffering=1) as logfile:
+    with log_path.open("a", encoding="utf-8", buffering=65536) as logfile:
         output_errors: list[BaseException] = []
 
         def forward_output() -> None:
             terminal_available = True
+            capturing_traceback = False
             try:
                 assert child.stdout is not None
                 for line in child.stdout:
-                    # Always drain stdout and persist logs even if the terminal is closed.
-                    logfile.write(line)
+                    # Always drain the pipe so shutdown cannot deadlock, but write only
+                    # high-value events to disk. Progress lines/tables remain terminal-only.
+                    if "Traceback (most recent call last)" in line:
+                        capturing_traceback = True
+                    selected = line if capturing_traceback else filter_persistent_log_text(line)
+                    if selected:
+                        logfile.write(selected)
+                        if should_flush_important_log(selected):
+                            logfile.flush()
+                    if capturing_traceback and is_exception_end(line):
+                        capturing_traceback = False
                     if terminal_available:
                         try:
-                            print(line, end="", flush=True)
+                            # The parent stdout is line-buffered when attached to a TTY;
+                            # explicitly flush only event/error lines to avoid extra syscalls.
+                            sys.stdout.write(line)
+                            if (not getattr(sys.stdout, "isatty", lambda: False)()) or is_important_log_line(line):
+                                sys.stdout.flush()
                         except BrokenPipeError:
                             terminal_available = False
             except BaseException as exc:
@@ -394,6 +411,10 @@ def stream_command(command: list[str], env: dict[str, str], cwd: Path, log_path:
                 except OSError:
                     pass
                 output_thread.join(timeout=1.0)
+            try:
+                child.stdout.close()
+            except OSError:
+                pass
         if output_errors:
             print(f"[Curriculum Warning] Child output forwarding raised {type(output_errors[0]).__name__}: {output_errors[0]}", flush=True)
 
@@ -448,26 +469,27 @@ def start_curriculum_tensorboard(root: Path, python: Path, cfg: dict[str, str], 
             )
             return
 
-    server_log = log_dir / "tensorboard_server.log"
     log_dir.mkdir(parents=True, exist_ok=True)
     try:
-        with server_log.open("a", encoding="utf-8", buffering=1) as log_handle:
-            process = subprocess.Popen(
-                [
-                    str(python), "-m", "tensorboard.main",
-                    f"--logdir={tensorboard_dir}", f"--port={actual_port}", "--host=127.0.0.1",
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            # Register ownership immediately, before any startup check can be interrupted.
-            _CURRICULUM_TENSORBOARD_PROCESS = process
-            _CURRICULUM_TENSORBOARD_PORT = actual_port
+        # The TensorBoard server can emit verbose request/startup logs. Avoid an
+        # ever-growing server log file; its health is checked here and status/errors
+        # are reported by the curriculum manager.
+        process = subprocess.Popen(
+            [
+                str(python), "-m", "tensorboard.main",
+                f"--logdir={tensorboard_dir}", f"--port={actual_port}", "--host=127.0.0.1",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        # Register ownership immediately, before any startup check can be interrupted.
+        _CURRICULUM_TENSORBOARD_PROCESS = process
+        _CURRICULUM_TENSORBOARD_PORT = actual_port
         time.sleep(0.6)
         if process.poll() is not None:
-            print(f"[TensorBoard Warning] Server exited; inspect {server_log}. Metrics will still be written.", flush=True)
+            print("[TensorBoard Warning] Server exited during startup; check TensorBoard installation, log directory, and port. Metrics will still be written.", flush=True)
             stop_managed_process(
                 process, "failed TensorBoard startup", graceful_signal=signal.SIGTERM,
                 graceful_timeout=0.0, terminate_timeout=0.5,
@@ -476,7 +498,7 @@ def start_curriculum_tensorboard(root: Path, python: Path, cfg: dict[str, str], 
             _CURRICULUM_TENSORBOARD_PORT = None
         else:
             print(f"[TensorBoard] http://127.0.0.1:{actual_port} | logdir={tensorboard_dir}", flush=True)
-            print(f"[TensorBoard] This curriculum owns the server; it will be stopped when the curriculum exits. Log={server_log}", flush=True)
+            print("[TensorBoard] Server output is suppressed; this curriculum stops its owned server on exit.", flush=True)
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"[TensorBoard Warning] Could not start TensorBoard: {exc}. Metrics will still be written.", flush=True)
 
@@ -561,13 +583,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-dir", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--start-stage", choices=STAGES, default=None,
-                        help="override the saved curriculum stage; otherwise resume a prior interrupted run")
+                        help="override the saved/current objective stage")
+    parser.add_argument("--stage-only", action="store_true",
+                        help="train only the selected stage for the configured chunk budget; skip all evaluation, archive comparison, and promotion")
     parser.add_argument("--dry-run", action="store_true", help="print planned commands without launching emulators")
     args = parser.parse_args()
     root = args.project_dir.expanduser().resolve()
     if not (root / "main.py").is_file() or not (root / "PokemonEmerald.gba").is_file():
         raise SystemExit(f"Project or ROM not found under {root}; run from the correct project directory.")
     cfg = parse_dotenv(root / ".env")
+    stage_only = stage_only_requested(args.stage_only, cfg)
     python = root / ".venv" / "bin" / "python"
     if not python.is_file():
         python = Path(sys.executable)
@@ -590,6 +615,13 @@ def main() -> int:
     run_state_path = root / "runtime_data" / "curriculum_state.json"
     run_log_path = log_dir / f"curriculum_manager_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.log"
 
+    def append_curriculum_event(message: str) -> None:
+        """Persist stage/evaluation outcomes, not routine progress output."""
+        run_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with run_log_path.open("a", encoding="utf-8", buffering=65536) as stream:
+            stream.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message.rstrip()}\n")
+            stream.flush()  # stage transitions/evaluation results are intentionally rare
+
     chunk_steps = int_setting(cfg, "POKEMON_AI_CURRICULUM_CHUNK_TIMESTEPS", 250_000)
     max_chunks = int_setting(cfg, "POKEMON_AI_CURRICULUM_MAX_CHUNKS_PER_STAGE", 8)
     eval_episodes = int_setting(cfg, "POKEMON_AI_CURRICULUM_EVAL_EPISODES", 5)
@@ -600,12 +632,32 @@ def main() -> int:
         raise SystemExit("POKEMON_AI_CURRICULUM_SUCCESS_RATE must be greater than zero.")
 
     current_stage = args.start_stage
+    configured_objective = os.environ.get("POKEMON_AI_OBJECTIVE", cfg.get("POKEMON_AI_OBJECTIVE", "starter")).strip()
+    if stage_only and current_stage is None:
+        # In stage-only mode the explicitly configured objective must win over any
+        # prior curriculum-state file; the user is asking for that one stage only.
+        if configured_objective not in STAGES:
+            raise SystemExit(
+                f"POKEMON_AI_OBJECTIVE={configured_objective!r} is not a known stage. "
+                f"Choose one of: {', '.join(STAGES)}"
+            )
+        current_stage = configured_objective
     if current_stage is None and run_state_path.is_file():
         try:
             saved_state = json.loads(run_state_path.read_text(encoding="utf-8"))
-            if saved_state.get("status") in {"running", "interrupted", "stage_not_mastered"} and saved_state.get("stage") in STAGES:
-                current_stage = saved_state["stage"]
-                print(f"[Curriculum] Resuming from saved stage {current_stage!r} (it will be re-evaluated first).", flush=True)
+            if saved_state.get("status") in {"running", "interrupted", "stage_not_mastered", "stage_only_training", "stage_only_budget_complete"} and saved_state.get("stage") in STAGES:
+                if saved_state.get("curriculum_plan") == CURRICULUM_PLAN_ID:
+                    current_stage = saved_state["stage"]
+                    if stage_only:
+                        print(f"[Curriculum] Stage-only mode selected saved stage {current_stage!r}; evaluations/promotions are disabled.", flush=True)
+                    else:
+                        print(f"[Curriculum] Resuming from saved stage {current_stage!r} (it will be re-evaluated first).", flush=True)
+                else:
+                    print(
+                        "[Curriculum] Previous stage plan is incompatible with this expanded objective sequence; "
+                        "restarting stage selection at 'starter'. The existing model checkpoint is retained and "
+                        "will be evaluated before any retraining.", flush=True
+                    )
         except (OSError, json.JSONDecodeError, AttributeError):
             print("[Curriculum Warning] Prior curriculum state is unreadable; starting from the first stage.", flush=True)
     if current_stage is None:
@@ -629,15 +681,30 @@ def main() -> int:
     print(" Pokémon Emerald curriculum controller", flush=True)
     print(f" ROM expected SHA-1 : {expected_rom_hash}", flush=True)
     print(f" Model checkpoint   : {checkpoint}", flush=True)
-    print(f" Evaluation gate    : {'deterministic' if deterministic else 'stochastic'}; "
-          f"{eval_episodes} episodes; success rate >= {threshold:.0%}", flush=True)
-    print(f" Train chunk        : {chunk_steps:,} transitions; maximum {max_chunks} chunks per stage", flush=True)
-    print(f" Checkpoint recovery: compare up to {compare_checkpoints} recent distinct archived models when the current model misses the gate", flush=True)
-    print(" Milestones         : starter -> Pokédex -> first Gym Badge", flush=True)
+    if stage_only:
+        print(" Mode                : STAGE-ONLY (evaluation, archive comparison, and promotion disabled)", flush=True)
+    else:
+        print(f" Evaluation gate    : {'deterministic' if deterministic else 'stochastic'}; "
+              f"{eval_episodes} episodes; success rate >= {threshold:.0%}", flush=True)
+    print(f" Train chunk        : {chunk_steps:,} transitions; maximum {max_chunks} chunks for this invocation/stage", flush=True)
+    if not stage_only:
+        print(f" Checkpoint recovery: compare up to {compare_checkpoints} recent distinct archived models when the current model misses the gate", flush=True)
+    print(" Milestones         : " + " -> ".join(STAGES), flush=True)
     print("=" * 72, flush=True)
 
     if args.dry_run:
         print("\n[Dry-run] No emulator will be started and no files/checkpoints will be changed.", flush=True)
+        if stage_only:
+            stage = current_stage
+            stage_start = initial_state if stage == "starter" else milestone_dir / f"{STAGES[STAGES.index(stage)-1]}.state"
+            print(f"\n[Dry-run] STAGE-ONLY: {stage} — {OBJECTIVE_LABELS[stage]}", flush=True)
+            print(f"  Start state       : {stage_start}", flush=True)
+            print(f"  Training chunks   : {max_chunks} × {chunk_steps:,} = {max_chunks * chunk_steps:,} transitions", flush=True)
+            print("  Evaluation        : DISABLED", flush=True)
+            print("  Checkpoint compare: DISABLED", flush=True)
+            print("  Promotion         : DISABLED; controller exits after this stage", flush=True)
+            print("\n[Dry-run] Stage-only plan preview complete (exit 0).", flush=True)
+            return 0
         for stage in STAGES[start_index:]:
             stage_start = initial_state if stage == "starter" else milestone_dir / f"{STAGES[STAGES.index(stage)-1]}.state"
             print(f"\n[Dry-run] Stage {stage}: start state={stage_start}", flush=True)
@@ -645,8 +712,10 @@ def main() -> int:
                 print(f"  1. Evaluate current checkpoint ({eval_episodes} episodes): {checkpoint}", flush=True)
                 if compare_checkpoints:
                     print(f"  2. If below gate, screen up to {compare_checkpoints} recent distinct archives and fully re-evaluate the best candidate.", flush=True)
+            elif stage == "starter":
+                print("  1. No checkpoint yet; start a fresh model from the canonical pre-starter state.", flush=True)
             else:
-                print("  1. No checkpoint yet; start a fresh model for the starter stage.", flush=True)
+                print("  1. No checkpoint yet; the real run must begin at starter before it can promote to this stage.", flush=True)
             print(f"  3. If not mastered, train up to {max_chunks} chunk(s) of {chunk_steps:,} transitions each; evaluate after each chunk.", flush=True)
             print(f"  4. Promote only after success_rate >= {threshold:.0%} and a fresh {stage}.state + matching manifest are created.", flush=True)
         print("\n[Dry-run] Plan preview complete (exit 0).", flush=True)
@@ -676,6 +745,7 @@ def main() -> int:
     base_env["POKEMON_AI_EVAL_EPISODES"] = str(eval_episodes)
     base_env["POKEMON_AI_EVAL_DETERMINISTIC"] = "1" if deterministic else "0"
     base_env["POKEMON_AI_REQUIRE_START_STATE"] = "1"
+    base_env["POKEMON_AI_CURRICULUM_STAGE_ONLY"] = "1" if stage_only else "0"
 
     def eval_stage(
         stage: str,
@@ -729,12 +799,13 @@ def main() -> int:
                 "Refusing to use stale or mismatched results."
             )
         report["_controller_evaluation_started_unix"] = evaluation_started_unix
-        print(
+        evaluation_summary = (
             f"[Curriculum Evaluation] stage={stage} successes={report.get('successes')}/"
             f"{requested_episodes} rate={float(report.get('success_rate', 0.0)):.1%} "
-            f"mean_steps={float(report.get('mean_steps', 0.0)):.0f} "
-            f"report={report_path}", flush=True,
+            f"mean_steps={float(report.get('mean_steps', 0.0)):.0f} report={report_path}"
         )
+        print(evaluation_summary, flush=True)
+        append_curriculum_event(evaluation_summary)
         return report
 
     def verified_fresh_milestone(stage: str, report: dict[str, Any] | None) -> bool:
@@ -825,6 +896,83 @@ def main() -> int:
         return full_report
 
     try:
+        if stage_only:
+            stage = current_stage
+            if stage == "starter":
+                stage_start_state = initial_state
+            else:
+                prior = STAGES[STAGES.index(stage) - 1]
+                stage_start_state = milestone_dir / f"{prior}.state"
+                manifest_path = Path(str(stage_start_state) + ".json")
+                if not stage_start_state.is_file() or not manifest_path.is_file():
+                    raise RuntimeError(
+                        f"Stage-only training for {stage} requires the prior {prior} milestone and metadata: {stage_start_state}"
+                    )
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if manifest.get("objective") != prior or manifest.get("rom_sha1_expected") != expected_rom_hash:
+                    raise RuntimeError(f"Milestone metadata does not match required objective/ROM: {manifest_path}")
+            if not stage_start_state.is_file():
+                raise FileNotFoundError(f"Required start state is missing: {stage_start_state}")
+
+            stage_message = (
+                f"[Stage-only] TRAINING {stage.upper()}: {OBJECTIVE_LABELS[stage]} | "
+                f"start={stage_start_state} | evaluation/promotions disabled"
+            )
+            print(f"\n{stage_message}", flush=True)
+            append_curriculum_event(stage_message)
+            for chunk_index in range(1, max_chunks + 1):
+                chunk_message = (
+                    f"[Stage-only] stage={stage} chunk={chunk_index}/{max_chunks} "
+                    f"transitions={chunk_steps:,}; no evaluation or promotion"
+                )
+                print(f"\n{chunk_message}", flush=True)
+                append_curriculum_event(chunk_message)
+                train_env = base_env.copy()
+                train_env["POKEMON_AI_PROFILE"] = "fast_train"
+                train_env["POKEMON_AI_MODE"] = "train"
+                train_env["POKEMON_AI_GUI_MODE"] = "0"
+                train_env["POKEMON_AI_RECORD_VIDEO"] = "0"
+                train_env["POKEMON_AI_AUTO_START_TENSORBOARD"] = "0"
+                train_env["POKEMON_AI_CURRICULUM_STAGE_ONLY"] = "0"
+                # Do not create an unverified stage milestone during un-gated training.
+                # A normal curriculum evaluation can later verify and publish it.
+                train_env["POKEMON_AI_MILESTONE_SAVE"] = "0"
+                train_env["POKEMON_AI_OBJECTIVE"] = stage
+                train_env["POKEMON_AI_TRAINING_START_STATE"] = str(stage_start_state)
+                train_env["POKEMON_AI_TOTAL_TIMESTEPS"] = str(chunk_steps)
+                stream_command([str(python), "main.py"], train_env, root, run_log_path, args.dry_run)
+                atomic_json(run_state_path, {
+                    "schema_version": 2,
+                    "curriculum_plan": CURRICULUM_PLAN_ID,
+                    "status": "stage_only_training",
+                    "stage": stage,
+                    "chunk_index": chunk_index,
+                    "chunks_total": max_chunks,
+                    "chunk_timesteps": chunk_steps,
+                    "evaluation_disabled": True,
+                    "promotion_disabled": True,
+                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                })
+
+            atomic_json(run_state_path, {
+                "schema_version": 2,
+                "curriculum_plan": CURRICULUM_PLAN_ID,
+                "status": "stage_only_budget_complete",
+                "stage": stage,
+                "chunks_trained_this_invocation": max_chunks,
+                "chunk_timesteps": chunk_steps,
+                "evaluation_disabled": True,
+                "promotion_disabled": True,
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            })
+            final_message = (
+                f"[Stage-only] BUDGET COMPLETE: trained {stage} for {max_chunks * chunk_steps:,} transitions. "
+                "No evaluation was run and no promotion occurred."
+            )
+            print(f"\n{final_message}", flush=True)
+            append_curriculum_event(final_message)
+            return 0
+
         for stage_index in range(start_index, len(STAGES)):
             stage = STAGES[stage_index]
             if stage == "starter":
@@ -841,7 +989,10 @@ def main() -> int:
                 if manifest.get("objective") != prior or manifest.get("rom_sha1_expected") != expected_rom_hash:
                     raise RuntimeError(f"Milestone metadata does not match required objective/ROM: {manifest_path}")
 
-            print(f"\n[Curriculum] STAGE {stage.upper()}: {OBJECTIVE_LABELS[stage]} | start={stage_start_state}", flush=True)
+            stage_message = f"[Curriculum] STAGE {stage.upper()}: {OBJECTIVE_LABELS[stage]} | start={stage_start_state}"
+            print(f"\n{stage_message}", flush=True)
+            if not args.dry_run:
+                append_curriculum_event(stage_message)
             if not args.dry_run and not stage_start_state.is_file():
                 raise FileNotFoundError(
                     f"Required start state is missing: {stage_start_state}. Save the canonical start or finish the preceding milestone first."
@@ -869,10 +1020,12 @@ def main() -> int:
 
             while not mastered and chunks_trained < max_chunks:
                 chunks_trained += 1
-                print(
-                    f"\n[Curriculum] Training stage={stage} chunk={chunks_trained}/{max_chunks} "
-                    f"additional_transitions={chunk_steps:,}.", flush=True,
+                chunk_message = (
+                    f"[Curriculum] Training stage={stage} chunk={chunks_trained}/{max_chunks} "
+                    f"additional_transitions={chunk_steps:,}."
                 )
+                print(f"\n{chunk_message}", flush=True)
+                append_curriculum_event(chunk_message)
                 train_env = base_env.copy()
                 train_env["POKEMON_AI_PROFILE"] = "fast_train"
                 train_env["POKEMON_AI_MODE"] = "train"
@@ -902,7 +1055,7 @@ def main() -> int:
 
                 if not args.dry_run:
                     atomic_json(run_state_path, {
-                        "schema_version": 1,
+                        "schema_version": 2, "curriculum_plan": CURRICULUM_PLAN_ID,
                         "status": "running" if mastered else "stage_not_mastered",
                         "stage": stage,
                         "chunks_trained_this_invocation": chunks_trained,
@@ -915,21 +1068,25 @@ def main() -> int:
             if not mastered:
                 if not args.dry_run:
                     atomic_json(run_state_path, {
-                        "schema_version": 1, "status": "stage_not_mastered", "stage": stage,
+                        "schema_version": 2, "curriculum_plan": CURRICULUM_PLAN_ID, "status": "stage_not_mastered", "stage": stage,
                         "chunks_trained_this_invocation": chunks_trained, "chunk_timesteps": chunk_steps,
                         "success_threshold": threshold, "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     })
-                print(
+                not_mastered_message = (
                     f"[Curriculum] NOT PROMOTED: {stage} did not meet the evaluation gate after "
-                    f"{chunks_trained} training chunks. Your checkpoint is preserved; rerun to continue.",
-                    flush=True,
+                    f"{chunks_trained} training chunks. Checkpoint preserved; rerun to continue."
                 )
+                print(not_mastered_message, flush=True)
+                append_curriculum_event(not_mastered_message)
                 return 2
 
-            print(f"[Curriculum] MASTERED: {stage} ({OBJECTIVE_LABELS[stage]}); milestone verified.", flush=True)
+            mastered_message = f"[Curriculum] MASTERED: {stage} ({OBJECTIVE_LABELS[stage]}); milestone verified."
+            print(mastered_message, flush=True)
+            if not args.dry_run:
+                append_curriculum_event(mastered_message)
             if not args.dry_run:
                 atomic_json(run_state_path, {
-                    "schema_version": 1, "status": "mastered", "stage": stage,
+                    "schema_version": 2, "curriculum_plan": CURRICULUM_PLAN_ID, "status": "mastered", "stage": stage,
                     "chunks_trained_this_invocation": chunks_trained, "chunk_timesteps": chunk_steps,
                     "success_threshold": threshold, "milestone_state": str(milestone_dir / f"{stage}.state"),
                     "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -937,25 +1094,39 @@ def main() -> int:
 
         if not args.dry_run:
             atomic_json(run_state_path, {
-                "schema_version": 1, "status": "complete", "stage": STAGES[-1],
+                "schema_version": 2, "curriculum_plan": CURRICULUM_PLAN_ID, "status": "complete", "stage": STAGES[-1],
                 "milestones": [str(milestone_dir / f"{stage}.state") for stage in STAGES],
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             })
-        print("\n[Curriculum] COMPLETE: all configured stages passed the evaluation gate.", flush=True)
+        complete_message = "[Curriculum] COMPLETE: all configured stages passed the evaluation gate."
+        print(f"\n{complete_message}", flush=True)
+        if not args.dry_run:
+            append_curriculum_event(complete_message)
         return 0
     except KeyboardInterrupt:
         if not args.dry_run:
             atomic_json(run_state_path, {
-                "schema_version": 1, "status": "interrupted", "stage": stage if 'stage' in locals() else current_stage,
+                "schema_version": 2, "curriculum_plan": CURRICULUM_PLAN_ID, "status": "interrupted", "stage": stage if 'stage' in locals() else current_stage,
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             })
-        print("[Curriculum] Interrupted. Model/state checkpoints are retained; rerun to re-evaluate and resume.", flush=True)
+        interrupted_message = (
+            "[Stage-only] Interrupted. Model/checkpoints are retained; no evaluation or promotion was performed."
+            if stage_only else
+            "[Curriculum] Interrupted. Model/state checkpoints are retained; rerun to re-evaluate and resume."
+        )
+        print(interrupted_message, flush=True)
+        if not args.dry_run:
+            append_curriculum_event(interrupted_message)
         return 130
     except Exception as exc:
         if not args.dry_run:
             try:
+                append_curriculum_event(f"[Curriculum Error] {type(exc).__name__}: {exc}")
+            except Exception:
+                pass
+            try:
                 atomic_json(run_state_path, {
-                    "schema_version": 1, "status": "error", "stage": stage if 'stage' in locals() else current_stage,
+                    "schema_version": 2, "curriculum_plan": CURRICULUM_PLAN_ID, "status": "error", "stage": stage if 'stage' in locals() else current_stage,
                     "error": f"{type(exc).__name__}: {exc}",
                     "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 })

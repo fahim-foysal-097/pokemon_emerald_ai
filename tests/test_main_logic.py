@@ -11,8 +11,11 @@ from __future__ import annotations
 import os
 import tempfile
 import hashlib
+import inspect
+import queue
 import unittest
 import zipfile
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,88 +25,6 @@ import main
 
 
 class MainLogicTests(unittest.TestCase):
-    def test_numeric_info_pairs_preserve_worker_identity_and_ignore_invalid_values(self):
-        infos = [
-            {"party_count": 0},
-            {"party_count": 1},
-            {"party_count": None},
-            {"party_count": float("nan")},
-            {"party_count": "unknown"},
-        ]
-        self.assertEqual(main._numeric_info_pairs(infos, "party_count"), [(0, 0.0), (1, 1.0)])
-
-    def test_progress_table_wraps_long_rows_and_keeps_box_width_consistent(self):
-        rendered = main._format_progress_table(
-            "Pokémon Emerald RL progress",
-            [("Worker state", " | ".join(f"E{i}: P0 Lv0 B0 M16@(11,15)" for i in range(8)))],
-            width=104,
-        )
-        lines = rendered.splitlines()
-        self.assertGreater(len(lines), 4)
-        self.assertEqual(len({len(line) for line in lines}), 1)
-        self.assertTrue(lines[0].startswith("+"))
-        self.assertTrue(lines[-1].startswith("+"))
-
-    def test_tensorboard_progress_tag_names_are_short_enough_to_avoid_sb3_truncation_collisions(self):
-        tags = [
-            "progress/party_count", "progress/party_count_mean", "progress/party_count_env_3",
-            "progress/party_count_peak", "progress/party_total_levels_env_3", "progress/ep_task_lastdone",
-            "progress/ep_task_mean100", "progress/party_ram_mismatch",
-            "progress/saveblock_party_count_env_3", "progress/transitions_per_sec",
-            "policy/action_entropy_4k", "policy/action_dominance_4k", "policy/greedy_entropy_512",
-            "policy/greedy_dominance_512", "policy/greedy_select_pct", "policy/act_select_pct",
-        ]
-        visible_keys_by_group = {}
-        for tag in tags:
-            # SB3's default HumanOutputFormat reserves a few spaces when rendering the
-            # final path segment, then truncates to 36 chars. Keep all custom keys short.
-            group, name = tag.split("/", 1)
-            visible_key = "   " + name
-            self.assertLessEqual(len(visible_key), 36, msg=f"too-long TensorBoard/logger key: {tag}")
-            visible_keys_by_group.setdefault(group, []).append(visible_key)
-        for group, visible_keys in visible_keys_by_group.items():
-            self.assertEqual(len(visible_keys), len(set(visible_keys)), msg=f"logger key collision in {group}/")
-
-    def test_screen_signature_is_stable_for_equivalent_hwc_and_chw_images(self):
-        image = np.full((80, 120, 3), 128, dtype=np.uint8)
-        signature_hwc = main._screen_observation_signature({"screen": image})
-        signature_chw = main._screen_observation_signature({"screen": np.moveaxis(image, -1, 0)})
-        self.assertIsNotNone(signature_hwc)
-        self.assertEqual(signature_hwc, signature_chw)
-
-    def test_actor_state_numpy_extracts_recurrent_actor_state(self):
-        import torch
-        state = SimpleNamespace(
-            pi=(torch.zeros((1, 4, 8)), torch.ones((1, 4, 8))),
-            vf=(torch.zeros((1, 4, 8)), torch.zeros((1, 4, 8))),
-        )
-        actor_state = main._actor_state_numpy(state)
-        self.assertEqual(len(actor_state), 2)
-        self.assertEqual(actor_state[0].shape, (1, 4, 8))
-        self.assertEqual(float(actor_state[1].mean()), 1.0)
-
-    def test_policy_probability_diagnostic_reports_the_actual_argmax_distribution(self):
-        import torch
-
-        class FakePolicy:
-            lstm_hidden_state_shape = (1, 1, 4)
-
-            def obs_to_tensor(self, observation):
-                return observation, True
-
-            def get_distribution(self, observation, state, episode_starts):
-                probabilities = torch.tensor([[0.015, 0.015, 0.015, 0.015, 0.015, 0.015, 0.88, 0.015, 0.015]])
-                return SimpleNamespace(distribution=SimpleNamespace(probs=probabilities)), state
-
-        model = SimpleNamespace(policy=FakePolicy(), device=torch.device("cpu"))
-        observation = {"screen": np.zeros((1, 3, 80, 120), dtype=np.uint8)}
-        summary = main._policy_action_probability_summary(
-            model, observation, None, np.asarray([True], dtype=bool)
-        )
-        self.assertIsNotNone(summary)
-        self.assertIn("B=88.0%", summary)
-        self.assertIn("maxP=88.0%", summary)
-
     def test_boolean_environment_flag_parser(self):
         old_value = os.environ.get("TEST_BOOLEAN_FLAG")
         try:
@@ -121,6 +42,136 @@ class MainLogicTests(unittest.TestCase):
                 os.environ.pop("TEST_BOOLEAN_FLAG", None)
             else:
                 os.environ["TEST_BOOLEAN_FLAG"] = old_value
+
+    def test_gen3_experience_decoder_uses_ot_personality_xor_and_validates_species(self):
+        personality = 0x12345678
+        ot_id = 0x9ABCDEF0
+        key = personality ^ ot_id
+        species = 280  # Ralts
+        experience = 12345
+        encrypted_species_item = ((0 << 16) | species) ^ key
+        encrypted_experience = experience ^ key
+        self.assertEqual(
+            main._decode_gen3_growth_words(
+                personality, ot_id, encrypted_species_item, encrypted_experience
+            ),
+            experience,
+        )
+        self.assertIsNone(
+            main._decode_gen3_growth_words(personality, ot_id, key, encrypted_experience)
+        )
+        self.assertIsNone(
+            main._decode_gen3_growth_words(personality, ot_id, encrypted_species_item, 0xFFFFFFFF)
+        )
+
+
+    def test_party_ram_diagnostic_signature_is_not_repeated_for_same_mismatch(self):
+        env = object.__new__(main.EmeraldEnv)
+        env._last_party_debug_signature = None
+        signature = (1, 0, 5, (5,), True)
+        self.assertTrue(env._party_debug_signature_changed(signature))
+        self.assertFalse(env._party_debug_signature_changed(signature))
+        self.assertFalse(env._party_debug_signature_changed(signature))
+        # Normal episode reset must not clear this persistent worker diagnostic guard.
+        reset_source = inspect.getsource(main.EmeraldEnv.reset)
+        self.assertNotIn("self._last_party_debug_signature = None", reset_source)
+
+    def test_game_state_reuses_cached_persistent_trainer_flags_between_polls(self):
+        env = object.__new__(main.EmeraldEnv)
+        saveblock = 0x02010000
+        env._read_saveblock1_pointer = lambda: saveblock
+
+        def read8(address):
+            if address == saveblock + main.SAVE_BLOCK1_PARTY_COUNT_OFFSET:
+                return 0
+            if address == main.PLAYER_PARTY_COUNT_ADDRESS:
+                return 0
+            if address == saveblock + main.SAVE_BLOCK1_LOCATION_OFFSET:
+                return 1
+            if address == saveblock + main.SAVE_BLOCK1_LOCATION_OFFSET + 1:
+                return 2
+            return 0
+
+        env._read8 = read8
+        env._read_badge_flags = lambda _pointer: 0
+        env._read_player_position = lambda _pointer: (4, 5)
+        env._read_story_flags = lambda _pointer: set()
+        flag_reads = []
+
+        def read_trainer_flags(pointer):
+            flag_reads.append(pointer)
+            return {0x500}
+
+        env._read_trainer_flags = read_trainer_flags
+        env._cached_trainer_flags = {0x501}
+
+        cached_state = env._read_game_state(include_trainer_flags=False)
+        self.assertEqual(cached_state["trainer_flags"], {0x501})
+        self.assertEqual(flag_reads, [])
+
+        refreshed_state = env._read_game_state(include_trainer_flags=True)
+        self.assertEqual(refreshed_state["trainer_flags"], {0x500})
+        self.assertEqual(flag_reads, [saveblock])
+        self.assertEqual(env._cached_trainer_flags, {0x500})
+
+    def test_headless_audio_drain_reuses_scratch_and_skips_numpy_copy(self):
+        class FakeFFI:
+            def __init__(self):
+                self.allocations = 0
+
+            def new(self, _ctype, values):
+                self.allocations += 1
+                return bytearray(values * 2)
+
+            @staticmethod
+            def sizeof(_ctype):
+                return 2
+
+            @staticmethod
+            def buffer(pointer, byte_count):
+                return memoryview(pointer)[:byte_count]
+
+        audio = object.__new__(main.MGBAAudioOutput)
+        audio.buffer = object()
+        audio.ffi = FakeFFI()
+        audio.channels = 2
+        audio._drain_scratch = None
+        audio._drain_scratch_values = 0
+        audio.output_active = False
+        audio.muted = False
+        audio.record_wave = None
+        audio.samples_drained = 0
+        audio.error = None
+
+        pending = {"frames": 128}
+
+        def available(_buffer):
+            return pending["frames"]
+
+        def read(_buffer, target, frames):
+            target[:frames * audio.channels * 2] = b"\x00" * (frames * audio.channels * 2)
+            pending["frames"] -= frames
+            return frames
+
+        audio.available_audio = available
+        audio.read_audio = read
+
+        with patch.object(main.np, "frombuffer", side_effect=AssertionError("discard path copied PCM")):
+            audio.drain(accept=False, record=False)
+            pending["frames"] = 64
+            audio.drain(accept=False, record=False)
+
+        self.assertEqual(audio.samples_drained, 192)
+        self.assertEqual(audio.ffi.allocations, 1)
+        self.assertEqual(audio._drain_scratch_values, 256)
+        self.assertIsNone(audio.error)
+
+    def test_reward_configuration_includes_small_battle_experience_component(self):
+        self.assertIn("battle_exp", main.REWARD_COMPONENT_NAMES)
+        self.assertGreaterEqual(main.BATTLE_EXP_REWARD_PER_100, 0.0)
+        self.assertGreaterEqual(main.BATTLE_EXP_REWARD_CAP_PER_POLL, 0.0)
+        self.assertGreaterEqual(main.BATTLE_EXP_POLL_INTERVAL, 1)
+        self.assertGreater(main.TASK_SUCCESS_REWARD, 0.0)
 
     def test_start_and_select_action_indices_are_known(self):
         self.assertEqual(main.ACTION_TO_KEY[7], "START")
@@ -411,13 +462,25 @@ class MainLogicTests(unittest.TestCase):
             env._read_game_state()
 
     def test_objective_registry_and_success_conditions(self):
-        starter_state = {"party_count": 1, "party_levels": 5, "story_flags": set(), "badge_count": 0}
+        from curriculum_objectives import BIRCH_LAB_MAP_ID, RIVAL_DEFEATED_ROUTE103_FLAG_ID
+
+        starter_state = {
+            "party_count": 1, "party_levels": 5, "map_id": BIRCH_LAB_MAP_ID,
+            "story_flags": {main.STARTER_OBTAINED_FLAG_ID}, "badge_count": 0,
+        }
         self.assertTrue(main._objective_satisfied("starter", starter_state))
         self.assertFalse(main._objective_satisfied("starter", dict(starter_state, party_levels=0)))
         self.assertFalse(main._objective_satisfied("starter", dict(starter_state, party_count=7)))
         self.assertFalse(main._objective_satisfied("starter", dict(starter_state, party_levels=601)))
-        self.assertTrue(main._objective_satisfied(
-            "pokedex", dict(starter_state, story_flags={main.POKEDEX_OBTAINED_FLAG_ID})
+
+        pokedex_state = dict(starter_state, story_flags={
+            main.STARTER_OBTAINED_FLAG_ID,
+            RIVAL_DEFEATED_ROUTE103_FLAG_ID,
+            main.POKEDEX_OBTAINED_FLAG_ID,
+        })
+        self.assertTrue(main._objective_satisfied("pokedex", pokedex_state))
+        self.assertFalse(main._objective_satisfied(
+            "pokedex", dict(pokedex_state, story_flags={main.POKEDEX_OBTAINED_FLAG_ID})
         ))
         self.assertFalse(main._objective_satisfied("pokedex", starter_state))
         self.assertTrue(main._objective_satisfied("first_badge", dict(starter_state, badge_count=1)))
@@ -427,6 +490,11 @@ class MainLogicTests(unittest.TestCase):
             main._objective_satisfied("made_up_goal", starter_state)
 
     def test_start_state_validation_supports_later_curriculum_goals(self):
+        from curriculum_objectives import (
+            BIRCH_LAB_MAP_ID, OLDALE_TOWN_MAP_ID, ROUTE_103_MAP_ID,
+            RIVAL_DEFEATED_ROUTE103_FLAG_ID,
+        )
+
         base = {
             "player_x": 11, "player_y": 15, "map_id": main.ROUTE_101_MAP_ID,
             "party_count": 0, "party_levels": 0, "badge_count": 0, "badge_flags": 0,
@@ -434,21 +502,38 @@ class MainLogicTests(unittest.TestCase):
         }
         self.assertIn("starter in the live party", main._training_start_validation_error(base, objective="pokedex"))
         self.assertIn("valid Pokémon in the live party", main._training_start_validation_error(base, objective="first_badge"))
-        starter_milestone = dict(base, party_count=1, party_levels=5, story_flags={
+
+        starter_milestone = dict(base, map_id=BIRCH_LAB_MAP_ID, party_count=1, party_levels=5, story_flags={
             main.CLOCK_SET_FLAG_ID, main.STARTER_OBTAINED_FLAG_ID
         })
-        self.assertIsNone(main._training_start_validation_error(starter_milestone, objective="pokedex"))
-        pokedex_milestone = dict(starter_milestone, story_flags={
-            main.CLOCK_SET_FLAG_ID, main.STARTER_OBTAINED_FLAG_ID, main.POKEDEX_OBTAINED_FLAG_ID
+        self.assertIsNone(main._training_start_validation_error(starter_milestone, objective="leave_birch_lab"))
+
+        route101_milestone = dict(starter_milestone, map_id=main.ROUTE_101_MAP_ID)
+        self.assertIsNone(main._training_start_validation_error(route101_milestone, objective="reach_oldale"))
+
+        oldale_milestone = dict(route101_milestone, map_id=OLDALE_TOWN_MAP_ID)
+        self.assertIsNone(main._training_start_validation_error(oldale_milestone, objective="reach_route103"))
+
+        route103_milestone = dict(oldale_milestone, map_id=ROUTE_103_MAP_ID)
+        self.assertIsNone(main._training_start_validation_error(route103_milestone, objective="defeat_rival"))
+
+        rival_milestone = dict(route103_milestone, story_flags={
+            main.CLOCK_SET_FLAG_ID, main.STARTER_OBTAINED_FLAG_ID, RIVAL_DEFEATED_ROUTE103_FLAG_ID
+        })
+        self.assertIsNone(main._training_start_validation_error(rival_milestone, objective="return_birch_lab"))
+
+        lab_after_rival = dict(rival_milestone, map_id=BIRCH_LAB_MAP_ID)
+        self.assertIsNone(main._training_start_validation_error(lab_after_rival, objective="pokedex"))
+
+        pokedex_milestone = dict(lab_after_rival, story_flags={
+            main.CLOCK_SET_FLAG_ID, main.STARTER_OBTAINED_FLAG_ID,
+            RIVAL_DEFEATED_ROUTE103_FLAG_ID, main.POKEDEX_OBTAINED_FLAG_ID,
         })
         self.assertIsNone(main._training_start_validation_error(pokedex_milestone, objective="first_badge"))
-        already_pokedex = dict(base, party_count=1, party_levels=5, story_flags={
-            main.CLOCK_SET_FLAG_ID, main.POKEDEX_OBTAINED_FLAG_ID
-        })
-        self.assertIn(
-            "already complete",
-            main._training_start_validation_error(already_pokedex, objective="pokedex"),
-        )
+        # A verified Pokedex start can be accepted and immediately marked complete;
+        # the controller must not reject a milestone merely because it is already met.
+        self.assertIsNone(main._training_start_validation_error(pokedex_milestone, objective="pokedex"))
+        self.assertTrue(main._objective_satisfied("pokedex", pokedex_milestone))
 
     def test_completed_episode_metrics_ignore_running_sums_and_stopped_episodes(self):
         infos = [
