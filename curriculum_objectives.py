@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from numbers import Real
+from pathlib import Path
 
 CURRICULUM_PLAN_ID = "emerald_intro_v4"
 
@@ -71,6 +72,111 @@ OBJECTIVE_DEFINITIONS = {
     },
 }
 OBJECTIVE_LABELS = {name: definition["label"] for name, definition in OBJECTIVE_DEFINITIONS.items()}
+
+
+def stage_start_state_path(
+    project_dir: str | Path,
+    objective: str,
+    canonical_start_state: str | Path | None = None,
+) -> Path:
+    """Return the one authoritative savestate path for a curriculum objective.
+
+    The first stage always starts from the pre-starter Route 101 state. Every
+    later stage starts from the immediately preceding milestone. The permanent
+    canonical path is intentionally separate from POKEMON_AI_TRAINING_START_STATE,
+    which is stage-specific and may be rewritten by configure_training.py.
+    """
+    root = Path(project_dir).expanduser().resolve()
+    stage = str(objective or "").strip().lower()
+    if stage not in STAGES:
+        raise ValueError(f"Unknown stage {stage!r}; choose one of: {', '.join(STAGES)}")
+
+    index = STAGES.index(stage)
+    configured = canonical_start_state or "runtime_data/states/training_start.state"
+    candidate = Path(configured).expanduser()
+    canonical_path = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    milestone_root = (root / "runtime_data" / "states" / "milestones").resolve()
+    try:
+        canonical_path.relative_to(milestone_root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(
+            "POKEMON_AI_CANONICAL_START_STATE cannot point inside the completed-milestones directory: "
+            f"{canonical_path}. It must identify the pre-starter Route 101 savestate."
+        )
+
+    if index == 0:
+        return canonical_path
+
+    prior_stage = STAGES[index - 1]
+    return (root / "runtime_data" / "states" / "milestones" / f"{prior_stage}.state").resolve()
+
+
+def resolve_runtime_start_state_path(
+    project_dir: str | Path,
+    objective: str,
+    *,
+    mode: str = "train",
+    canonical_start_state: str | Path | None = None,
+    training_start_state: str | Path | None = None,
+) -> Path:
+    """Resolve and enforce the runtime start-state contract for every app entry point.
+
+    Setup mode is special: it always writes the canonical pre-starter Route 101
+    state, never a stage milestone. In all other modes, the optional
+    POKEMON_AI_TRAINING_START_STATE must exactly match the selected objective's
+    shared stage mapping. This catches stale shell exports and stale .env values
+    before an emulator can load or overwrite the wrong savestate.
+
+    For legacy configurations without POKEMON_AI_CANONICAL_START_STATE, a
+    non-milestone training path is adopted as canonical only for the starter
+    objective. Setup mode never trusts the stage-specific variable because its
+    only safe destination is the stable pre-starter Route 101 path. Later-stage
+    milestone paths are never reinterpreted as the canonical Route 101 state.
+    """
+    root = Path(project_dir).expanduser().resolve()
+    stage = str(objective or "").strip().lower()
+    runtime_mode = str(mode or "train").strip().lower()
+    if stage not in STAGES:
+        raise ValueError(f"Unknown stage {stage!r}; choose one of: {', '.join(STAGES)}")
+
+    milestone_root = (root / "runtime_data" / "states" / "milestones").resolve()
+
+    def resolve(value: str | Path) -> Path:
+        candidate = Path(value).expanduser()
+        return candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+
+    canonical_value = str(canonical_start_state).strip() if canonical_start_state is not None else ""
+    training_value = str(training_start_state).strip() if training_start_state is not None else ""
+    if not canonical_value and training_value and stage == STAGES[0]:
+        legacy_candidate = resolve(training_value)
+        try:
+            legacy_candidate.relative_to(milestone_root)
+        except ValueError:
+            canonical_value = training_value
+
+    if not canonical_value:
+        canonical_value = "runtime_data/states/training_start.state"
+
+    # Resolve through the shared stage helper to apply its canonical-path guard.
+    canonical_path = stage_start_state_path(root, STAGES[0], canonical_value)
+    expected_stage_path = stage_start_state_path(root, stage, canonical_path)
+
+    if runtime_mode == "setup":
+        return canonical_path
+
+    if training_value:
+        configured_stage_path = resolve(training_value)
+        if configured_stage_path != expected_stage_path:
+            raise ValueError(
+                f"POKEMON_AI_OBJECTIVE={stage!r} must use its mapped start state "
+                f"{expected_stage_path}, but POKEMON_AI_TRAINING_START_STATE resolves to "
+                f"{configured_stage_path}. Run configure_training.py for this stage, or unset "
+                "the stale shell variable so the shared curriculum mapping can be used."
+            )
+
+    return expected_stage_path
 
 
 def _number(value):

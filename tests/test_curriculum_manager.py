@@ -16,6 +16,18 @@ from pathlib import Path
 import run_curriculum
 
 
+def isolated_project_env(**overrides: str) -> dict[str, str]:
+    """Keep subprocess config tests independent of the developer's exported POKEMON_AI_* vars.
+
+    Each fixture supplies its own .env. Inheriting the real project's POKEMON_AI_*
+    exports can silently replace fixture values because shell variables intentionally
+    take precedence over dotenv settings.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith("POKEMON_AI_")}
+    env.update(overrides)
+    return env
+
+
 class CurriculumManagerTests(unittest.TestCase):
 
     def test_curriculum_uses_shared_incremental_stage_plan(self):
@@ -27,6 +39,29 @@ class CurriculumManagerTests(unittest.TestCase):
         self.assertLess(STAGES.index("leave_birch_lab"), STAGES.index("reach_oldale"))
         self.assertLess(STAGES.index("reach_route103"), STAGES.index("defeat_rival"))
         self.assertLess(STAGES.index("return_birch_lab"), STAGES.index("pokedex"))
+
+    def test_critical_shell_overrides_of_dotenv_are_reported(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        values = {
+            "POKEMON_AI_OBJECTIVE": "starter",
+            "POKEMON_AI_CURRICULUM_STAGE_ONLY": "1",
+            "POKEMON_AI_CANONICAL_START_STATE": "runtime_data/states/training_start.state",
+        }
+        env = {
+            "POKEMON_AI_OBJECTIVE": "leave_birch_lab",
+            "POKEMON_AI_CURRICULUM_STAGE_ONLY": "0",
+            "POKEMON_AI_CANONICAL_START_STATE": "/tmp/alternate-start.state",
+        }
+        output = StringIO()
+        with mock.patch.dict(os.environ, env, clear=False), redirect_stdout(output):
+            run_curriculum.report_shell_config_overrides(values)
+            self.assertFalse(run_curriculum.stage_only_requested(False, values))
+        rendered = output.getvalue()
+        self.assertIn("POKEMON_AI_OBJECTIVE='leave_birch_lab'", rendered)
+        self.assertIn("POKEMON_AI_CURRICULUM_STAGE_ONLY='0'", rendered)
+        self.assertIn("POKEMON_AI_CANONICAL_START_STATE", rendered)
 
     def test_stage_only_flag_uses_cli_or_env_and_defaults_off(self):
         # main.py may load this project's .env into os.environ during unittest
@@ -55,7 +90,19 @@ class CurriculumManagerTests(unittest.TestCase):
             prior_state.write_bytes(b"savestate-placeholder")
             rom_hash = "f3ae088181bf583e55daf962a92bb46f4f1d07b7"
             Path(str(prior_state) + ".json").write_text(
-                json.dumps({"objective": "starter", "rom_sha1_expected": rom_hash}), encoding="utf-8"
+                json.dumps({
+                    "schema_version": 1,
+                    "objective": "starter",
+                    "rom_sha1_expected": rom_hash,
+                    "savestate_path": str(prior_state.resolve()),
+                    "state": {
+                        "party_count": 1,
+                        "party_levels": 5,
+                        "map_id": 260,
+                        "story_flags": [0x51, 0x52],
+                        "badge_count": 0,
+                    },
+                }), encoding="utf-8"
             )
             (root / ".env").write_text(
                 "POKEMON_AI_OBJECTIVE=leave_birch_lab\n"
@@ -67,7 +114,7 @@ class CurriculumManagerTests(unittest.TestCase):
             )
             result = subprocess.run(
                 [sys.executable, str(Path(run_curriculum.__file__).resolve()), "--project-dir", str(root), "--dry-run"],
-                text=True, capture_output=True, timeout=10,
+                text=True, capture_output=True, timeout=10, env=isolated_project_env(),
             )
         self.assertEqual(result.returncode, 0, msg=result.stderr + "\n" + result.stdout)
         self.assertIn("STAGE-ONLY", result.stdout)
@@ -75,6 +122,65 @@ class CurriculumManagerTests(unittest.TestCase):
         self.assertIn("Promotion         : DISABLED", result.stdout)
         self.assertNotIn("Evaluate current checkpoint", result.stdout)
         self.assertNotIn("[Curriculum] $", result.stdout)
+
+    def test_controller_ignores_inherited_stage_state_when_resolving_starter_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "main.py").write_text("# fixture\n", encoding="utf-8")
+            (root / "PokemonEmerald.gba").write_bytes(b"rom")
+            (root / "runtime_data/states/milestones").mkdir(parents=True)
+            (root / "runtime_data/states/milestones/starter.state").write_bytes(b"completed milestone")
+            (root / "runtime_data/states/training_start.state").write_bytes(b"pre-starter")
+            (root / ".env").write_text(
+                "POKEMON_AI_OBJECTIVE=starter\n"
+                "POKEMON_AI_CURRICULUM_STAGE_ONLY=1\n"
+                "POKEMON_AI_TRAINING_START_STATE=runtime_data/states/milestones/starter.state\n"
+                "POKEMON_AI_CURRICULUM_CHUNK_TIMESTEPS=16384\n"
+                "POKEMON_AI_CURRICULUM_MAX_CHUNKS_PER_STAGE=1\n"
+                "POKEMON_AI_EXPECTED_ROM_SHA1=f3ae088181bf583e55daf962a92bb46f4f1d07b7\n",
+                encoding="utf-8",
+            )
+            env = isolated_project_env(
+                POKEMON_AI_TRAINING_START_STATE=str(
+                    root / "runtime_data/states/milestones/starter.state"
+                )
+            )
+            result = subprocess.run(
+                [sys.executable, str(Path(run_curriculum.__file__).resolve()), "--project-dir", str(root), "--dry-run"],
+                text=True, capture_output=True, timeout=10, env=env,
+            )
+        self.assertEqual(result.returncode, 0, msg=result.stderr + "\n" + result.stdout)
+        self.assertIn("Ignoring inherited POKEMON_AI_TRAINING_START_STATE", result.stdout)
+        self.assertIn(str(root / "runtime_data/states/training_start.state"), result.stdout)
+
+    def test_stage_start_validator_rejects_missing_or_detached_manifest(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            milestone_dir = root / "runtime_data/states/milestones"
+            milestone_dir.mkdir(parents=True)
+            prior_state = milestone_dir / "starter.state"
+            prior_state.write_bytes(b"state")
+            manifest_path = Path(str(prior_state) + ".json")
+            valid = {
+                "objective": "starter",
+                "rom_sha1_expected": "f3ae088181bf583e55daf962a92bb46f4f1d07b7",
+                "savestate_path": str(prior_state.resolve()),
+                "state": {
+                    "party_count": 1, "party_levels": 5, "map_id": 260,
+                    "story_flags": [0x51, 0x52], "badge_count": 0,
+                },
+            }
+            manifest_path.write_text(json.dumps(valid), encoding="utf-8")
+            run_curriculum.validate_stage_start_state(
+                root, "leave_birch_lab", prior_state,
+                "f3ae088181bf583e55daf962a92bb46f4f1d07b7",
+            )
+            manifest_path.write_text(json.dumps({k: v for k, v in valid.items() if k != "savestate_path"}), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "missing its savestate_path"):
+                run_curriculum.validate_stage_start_state(
+                    root, "leave_birch_lab", prior_state,
+                    "f3ae088181bf583e55daf962a92bb46f4f1d07b7",
+                )
 
     def test_dotenv_parser_uses_first_occurrence_and_strips_quotes(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -86,6 +192,13 @@ class CurriculumManagerTests(unittest.TestCase):
             values = run_curriculum.parse_dotenv(path)
         self.assertEqual(values["POKEMON_AI_MODEL_NAME"], "model_a")
         self.assertEqual(values["POKEMON_AI_EVAL_EPISODES"], "5")
+
+    def test_shutdown_timeout_parser_rejects_invalid_values(self):
+        self.assertEqual(run_curriculum._shutdown_timeout({}, "POKEMON_AI_SHUTDOWN_TIMEOUT", 900.0), 900.0)
+        self.assertEqual(run_curriculum._shutdown_timeout({"POKEMON_AI_SHUTDOWN_TIMEOUT": "120"}, "POKEMON_AI_SHUTDOWN_TIMEOUT", 900.0), 120.0)
+        for bad in ("0", "-1", "nan", "inf", "not-a-number"):
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                run_curriculum._shutdown_timeout({"POKEMON_AI_SHUTDOWN_TIMEOUT": bad}, "POKEMON_AI_SHUTDOWN_TIMEOUT", 900.0)
 
     def test_settings_validate_bounds(self):
         self.assertEqual(run_curriculum.int_setting({"N": "3"}, "N", 4), 3)

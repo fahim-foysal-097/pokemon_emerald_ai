@@ -74,7 +74,11 @@ class MainLogicTests(unittest.TestCase):
         self.assertFalse(env._party_debug_signature_changed(signature))
         # Normal episode reset must not clear this persistent worker diagnostic guard.
         reset_source = inspect.getsource(main.EmeraldEnv.reset)
+        step_source = inspect.getsource(main.EmeraldEnv.step)
         self.assertNotIn("self._last_party_debug_signature = None", reset_source)
+        # A reset to an empty party can briefly clear the mismatch; do not clear the
+        # worker's last-reported signature or it will spam the same table every episode.
+        self.assertNotIn("self._last_party_debug_signature = None", step_source)
 
     def test_game_state_reuses_cached_persistent_trainer_flags_between_polls(self):
         env = object.__new__(main.EmeraldEnv)
@@ -639,36 +643,36 @@ class MainLogicTests(unittest.TestCase):
             "badge_flags": 0,
             "story_flags": {main.CLOCK_SET_FLAG_ID},
         }
-        self.assertIsNone(main._training_start_validation_error(base))
+        self.assertIsNone(main._training_start_validation_error(base, objective="starter"))
         # Optional unrelated RAM fields do not prescribe a route or policy direction.
-        self.assertIsNone(main._training_start_validation_error(dict(base, any_script_var=42)))
+        self.assertIsNone(main._training_start_validation_error(dict(base, any_script_var=42), objective="starter"))
 
         bad_clock = dict(base, story_flags=set())
-        self.assertIn("clock-set flag", main._training_start_validation_error(bad_clock))
+        self.assertIn("clock-set flag", main._training_start_validation_error(bad_clock, objective="starter"))
         already_rescued = dict(base, story_flags={main.CLOCK_SET_FLAG_ID, main.BIRCH_RESCUED_FLAG_ID})
-        self.assertIn("before rescuing Birch", main._training_start_validation_error(already_rescued))
+        self.assertIn("before rescuing Birch", main._training_start_validation_error(already_rescued, objective="starter"))
 
         wrong_map = dict(base, map_id=258)
-        self.assertIn("Route 101", main._training_start_validation_error(wrong_map))
+        self.assertIn("Route 101", main._training_start_validation_error(wrong_map, objective="starter"))
 
         with_party = dict(base, party_count=1, party_levels=5)
-        self.assertIn("before receiving a starter", main._training_start_validation_error(with_party))
+        self.assertIn("before receiving a starter", main._training_start_validation_error(with_party, objective="starter"))
 
         with_stray_levels = dict(base, party_levels=5)
-        self.assertIn("empty party", main._training_start_validation_error(with_stray_levels))
+        self.assertIn("empty party", main._training_start_validation_error(with_stray_levels, objective="starter"))
 
     def test_start_state_validator_returns_errors_for_malformed_telemetry(self):
-        self.assertIn("state dictionary", main._training_start_validation_error(None))
+        self.assertIn("state dictionary", main._training_start_validation_error(None, objective="starter"))
         base = {
             "player_x": 11, "player_y": 15, "map_id": main.ROUTE_101_MAP_ID,
             "party_count": 0, "party_levels": 0, "badge_count": 0, "badge_flags": 0,
             "story_flags": {main.CLOCK_SET_FLAG_ID},
         }
-        self.assertIn("coordinates", main._training_start_validation_error(dict(base, player_x=float("nan"))))
-        self.assertIn("map ID", main._training_start_validation_error(dict(base, map_id="invalid")))
-        self.assertIn("story flags", main._training_start_validation_error(dict(base, story_flags=None)))
-        self.assertIn("party count/levels", main._training_start_validation_error(dict(base, party_count=7)))
-        self.assertIn("party count/levels", main._training_start_validation_error(dict(base, party_levels=float("inf"))))
+        self.assertIn("coordinates", main._training_start_validation_error(dict(base, player_x=float("nan")), objective="starter"))
+        self.assertIn("map ID", main._training_start_validation_error(dict(base, map_id="invalid"), objective="starter"))
+        self.assertIn("story flags", main._training_start_validation_error(dict(base, story_flags=None), objective="starter"))
+        self.assertIn("party count/levels", main._training_start_validation_error(dict(base, party_count=7), objective="starter"))
+        self.assertIn("party count/levels", main._training_start_validation_error(dict(base, party_levels=float("inf")), objective="starter"))
 
     def test_existing_reward_weights_are_preserved_and_time_cost_is_small(self):
         self.assertGreater(main.STORY_FLAG_REWARDS[main.BIRCH_RESCUED_FLAG_ID], 5.0)

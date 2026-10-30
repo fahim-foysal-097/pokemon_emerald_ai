@@ -16,6 +16,7 @@ import argparse
 import atexit
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -31,7 +32,10 @@ from pathlib import Path
 from typing import Any
 
 from important_logging import filter_persistent_log_text, is_important_log_line, should_flush_important_log, is_exception_end
-from curriculum_objectives import CURRICULUM_PLAN_ID, OBJECTIVE_LABELS, STAGES
+from curriculum_objectives import (
+    CURRICULUM_PLAN_ID, OBJECTIVE_LABELS, STAGES,
+    objective_start_error, stage_start_state_path,
+)
 
 
 # Only terminate processes created by this curriculum invocation. Existing servers
@@ -71,6 +75,31 @@ def bool_setting(values: dict[str, str], key: str, default: bool) -> bool:
 def stage_only_requested(cli_enabled: bool, values: dict[str, str]) -> bool:
     """Stage-only mode is enabled by CLI or .env/shell; it never promotes or evaluates."""
     return bool(cli_enabled or bool_setting(values, "POKEMON_AI_CURRICULUM_STAGE_ONLY", False))
+
+
+def report_shell_config_overrides(values: dict[str, str]) -> None:
+    """Make important shell-over-.env precedence visible instead of silently surprising users."""
+    keys = (
+        "POKEMON_AI_OBJECTIVE",
+        "POKEMON_AI_CURRICULUM_STAGE_ONLY",
+        "POKEMON_AI_CANONICAL_START_STATE",
+    )
+    for key in keys:
+        shell_value = os.environ.get(key)
+        dotenv_value = values.get(key)
+        if shell_value is None or dotenv_value is None:
+            continue
+        shell_normalized = shell_value.strip()
+        dotenv_normalized = dotenv_value.strip()
+        if key in {"POKEMON_AI_OBJECTIVE", "POKEMON_AI_CURRICULUM_STAGE_ONLY"}:
+            shell_normalized = shell_normalized.lower()
+            dotenv_normalized = dotenv_normalized.lower()
+        if shell_normalized != dotenv_normalized:
+            print(
+                f"[Config Warning] Shell environment overrides .env: {key}={shell_value!r}; "
+                f".env contains {dotenv_value!r}. The shell value is active.",
+                flush=True,
+            )
 
 
 def int_setting(values: dict[str, str], key: str, default: int, minimum: int = 1) -> int:
@@ -282,8 +311,8 @@ def stop_managed_process(
     label: str,
     *,
     graceful_signal: int = signal.SIGINT,
-    graceful_timeout: float = 20.0,
-    terminate_timeout: float = 5.0,
+    graceful_timeout: float = 900.0,
+    terminate_timeout: float = 60.0,
 ) -> None:
     """Stop an isolated process and descendants without leaving worker processes behind.
 
@@ -331,6 +360,18 @@ def stop_managed_process(
             process.wait(timeout=0)
         except (subprocess.TimeoutExpired, ChildProcessError):
             pass
+
+
+def _shutdown_timeout(env: dict[str, str], key: str, default: float) -> float:
+    """Read a positive finite shutdown timeout from the child environment."""
+    raw = env.get(key, str(default))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a positive number, got {raw!r}") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{key} must be a positive finite number, got {raw!r}")
+    return value
 
 
 def stream_command(command: list[str], env: dict[str, str], cwd: Path, log_path: Path, dry_run: bool) -> None:
@@ -388,12 +429,26 @@ def stream_command(command: list[str], env: dict[str, str], cwd: Path, log_path:
         try:
             code = child.wait()
         except KeyboardInterrupt:
-            print("\n[Curriculum] Stop requested. Asking main.py to save, then stopping any remaining workers...", flush=True)
-            stop_managed_process(child, "active main.py", graceful_signal=signal.SIGINT)
+            graceful_timeout = _shutdown_timeout(env, "POKEMON_AI_SHUTDOWN_TIMEOUT", 900.0)
+            terminate_timeout = _shutdown_timeout(env, "POKEMON_AI_SHUTDOWN_TERMINATE_TIMEOUT", 60.0)
+            print(
+                "\n[Curriculum] Stop requested. main.py will finish its current PPO rollout/update, "
+                f"save, and close workers (graceful window: {graceful_timeout:.0f}s).",
+                flush=True,
+            )
+            stop_managed_process(
+                child, "active main.py", graceful_signal=signal.SIGINT,
+                graceful_timeout=graceful_timeout, terminate_timeout=terminate_timeout,
+            )
             raise KeyboardInterrupt
         except BaseException:
             # Reap the process tree even on unexpected parent-side failures (e.g. disk/log errors).
-            stop_managed_process(child, "active main.py", graceful_signal=signal.SIGINT)
+            graceful_timeout = _shutdown_timeout(env, "POKEMON_AI_SHUTDOWN_TIMEOUT", 900.0)
+            terminate_timeout = _shutdown_timeout(env, "POKEMON_AI_SHUTDOWN_TERMINATE_TIMEOUT", 60.0)
+            stop_managed_process(
+                child, "active main.py", graceful_signal=signal.SIGINT,
+                graceful_timeout=graceful_timeout, terminate_timeout=terminate_timeout,
+            )
             raise
         finally:
             # If main.py exited but a worker still holds stdout open, terminate that worker
@@ -422,9 +477,134 @@ def stream_command(command: list[str], env: dict[str, str], cwd: Path, log_path:
         raise RuntimeError(f"Child process exited with code {code}: {printable}")
 
 
-def resolve_path(root: Path, configured: str) -> Path:
+def resolve_path(root: Path, configured: str | Path) -> Path:
     path = Path(configured).expanduser()
     return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
+def _is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve().relative_to(directory.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_canonical_initial_state(
+    root: Path,
+    cfg: dict[str, str],
+    cli_override: str | Path | None = None,
+) -> Path:
+    """Resolve the permanent pre-starter Route 101 state, not the selected-stage state.
+
+    POKEMON_AI_TRAINING_START_STATE is deliberately not read from the launching
+    shell: it is a transient, stage-specific variable and may be left over from
+    a previous stage/watch command. For backward compatibility, a legacy .env
+    value is reused only when it is outside the completed-milestones directory.
+    """
+    configured = None
+    if cli_override is not None:
+        configured = str(cli_override).strip()
+    if not configured:
+        configured = os.environ.get("POKEMON_AI_CANONICAL_START_STATE", "").strip()
+    if not configured:
+        configured = cfg.get("POKEMON_AI_CANONICAL_START_STATE", "").strip()
+
+    if not configured:
+        legacy = cfg.get("POKEMON_AI_TRAINING_START_STATE", "").strip()
+        if legacy:
+            legacy_path = resolve_path(root, legacy)
+            milestone_root = root / "runtime_data" / "states" / "milestones"
+            if not _is_within(legacy_path, milestone_root):
+                configured = legacy
+
+    if not configured:
+        configured = "runtime_data/states/training_start.state"
+
+    resolved = resolve_path(root, configured)
+    milestone_root = root / "runtime_data" / "states" / "milestones"
+    if _is_within(resolved, milestone_root):
+        raise ValueError(
+            "The canonical starter-stage path resolves inside the completed-milestones directory: "
+            f"{resolved}. Set POKEMON_AI_CANONICAL_START_STATE to the pre-starter Route 101 savestate."
+        )
+    return resolved
+
+
+def validate_stage_start_state(
+    root: Path,
+    stage: str,
+    start_state: Path,
+    expected_rom_hash: str,
+) -> None:
+    """Validate the immediate prerequisite milestone before a child process starts."""
+    if stage not in STAGES:
+        raise ValueError(f"Unknown curriculum stage {stage!r}; choose one of: {', '.join(STAGES)}")
+    if stage == STAGES[0]:
+        milestone_root = root / "runtime_data" / "states" / "milestones"
+        if _is_within(start_state, milestone_root):
+            raise RuntimeError(
+                f"Stage 'starter' cannot load a completed milestone as its initial savestate: {start_state}. "
+                "Use the canonical pre-starter Route 101 state."
+            )
+        if not start_state.is_file():
+            raise FileNotFoundError(f"Canonical starter start state is missing: {start_state}")
+        return
+
+    expected_state = stage_start_state_path(root, stage)
+    prior_stage = STAGES[STAGES.index(stage) - 1]
+    if start_state.resolve() != expected_state:
+        raise RuntimeError(
+            f"Stage {stage} must start from the immediately preceding {prior_stage} milestone "
+            f"({expected_state}), not {start_state}."
+        )
+    manifest_path = Path(str(expected_state) + ".json")
+    if not expected_state.is_file() or not manifest_path.is_file():
+        raise RuntimeError(
+            f"Stage {stage} requires the preceding {prior_stage} savestate and metadata: {expected_state}"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cannot read prerequisite milestone metadata {manifest_path}: {exc}") from exc
+
+    if manifest.get("objective") != prior_stage:
+        raise RuntimeError(
+            f"Prerequisite metadata {manifest_path} belongs to {manifest.get('objective')!r}, "
+            f"not the required prior objective {prior_stage!r}."
+        )
+    if str(manifest.get("rom_sha1_expected", "")).strip().lower() != expected_rom_hash:
+        raise RuntimeError(
+            f"Prerequisite milestone {manifest_path} was created for a different ROM identity; "
+            "refusing to start this stage."
+        )
+    recorded_state_path = manifest.get("savestate_path")
+    if not isinstance(recorded_state_path, str) or not recorded_state_path.strip():
+        raise RuntimeError(
+            f"Prerequisite metadata {manifest_path} is missing its savestate_path; "
+            "refusing to trust a detached or incomplete milestone manifest."
+        )
+    try:
+        recorded_path = Path(recorded_state_path).expanduser()
+        if not recorded_path.is_absolute():
+            recorded_path = root / recorded_path
+        if recorded_path.resolve() != expected_state:
+            raise RuntimeError(
+                f"Prerequisite metadata {manifest_path} points to a different savestate: "
+                f"{recorded_state_path!r}."
+            )
+    except (OSError, RuntimeError, ValueError) as exc:
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError(f"Invalid savestate path in {manifest_path}: {exc}") from exc
+
+    state_metrics = manifest.get("state")
+    prerequisite_error = objective_start_error(stage, state_metrics)
+    if prerequisite_error:
+        raise RuntimeError(
+            f"The {prior_stage} milestone metadata is not a valid start for {stage}: "
+            f"{prerequisite_error}. Recreate/verify the preceding milestone before continuing."
+        )
 
 
 def port_is_open(host: str, port: int, timeout: float = 0.25) -> bool:
@@ -584,6 +764,8 @@ def main() -> int:
     parser.add_argument("--project-dir", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--start-stage", choices=STAGES, default=None,
                         help="override the saved/current objective stage")
+    parser.add_argument("--initial-state", type=Path, default=None,
+                        help="explicit canonical pre-starter Route 101 savestate (used only for the starter stage)")
     parser.add_argument("--stage-only", action="store_true",
                         help="train only the selected stage for the configured chunk budget; skip all evaluation, archive comparison, and promotion")
     parser.add_argument("--dry-run", action="store_true", help="print planned commands without launching emulators")
@@ -592,6 +774,7 @@ def main() -> int:
     if not (root / "main.py").is_file() or not (root / "PokemonEmerald.gba").is_file():
         raise SystemExit(f"Project or ROM not found under {root}; run from the correct project directory.")
     cfg = parse_dotenv(root / ".env")
+    report_shell_config_overrides(cfg)
     stage_only = stage_only_requested(args.stage_only, cfg)
     python = root / ".venv" / "bin" / "python"
     if not python.is_file():
@@ -606,10 +789,18 @@ def main() -> int:
     if len(expected_rom_hash) != 40 or any(c not in "0123456789abcdef" for c in expected_rom_hash):
         raise SystemExit("POKEMON_AI_EXPECTED_ROM_SHA1 must be a 40-character hexadecimal SHA-1.")
 
-    initial_state_config = os.environ.get(
-        "POKEMON_AI_TRAINING_START_STATE", cfg.get("POKEMON_AI_TRAINING_START_STATE", "runtime_data/states/training_start.state")
-    )
-    initial_state = resolve_path(root, initial_state_config)
+    initial_state = resolve_canonical_initial_state(root, cfg, args.initial_state)
+    inherited_stage_state = os.environ.get("POKEMON_AI_TRAINING_START_STATE", "").strip()
+    if inherited_stage_state:
+        inherited_path = resolve_path(root, inherited_stage_state)
+        if inherited_path != initial_state:
+            print(
+                "[Config Warning] Ignoring inherited POKEMON_AI_TRAINING_START_STATE for curriculum "
+                f"stage mapping ({inherited_path}); canonical starter state is {initial_state}. "
+                "Use --initial-state or POKEMON_AI_CANONICAL_START_STATE for an intentional "
+                "starter-state override.",
+                flush=True,
+            )
     milestone_dir = root / "runtime_data" / "states" / "milestones"
     log_dir = root / "logs"
     run_state_path = root / "runtime_data" / "curriculum_state.json"
@@ -669,18 +860,26 @@ def main() -> int:
         raise SystemExit(
             f"No model checkpoint {checkpoint}; curriculum must start with 'starter' when training a new model."
         )
-    if current_stage != "starter":
-        required_prior = milestone_dir / f"{STAGES[STAGES.index(current_stage)-1]}.state"
-        required_manifest = Path(str(required_prior) + ".json")
-        if not required_prior.is_file() or not required_manifest.is_file():
-            raise SystemExit(
-                f"Cannot start at {current_stage}: prerequisite milestone is missing or unverified: {required_prior}"
-            )
+    current_stage_start_state = stage_start_state_path(root, current_stage, initial_state)
+    if not args.dry_run:
+        try:
+            validate_stage_start_state(root, current_stage, current_stage_start_state, expected_rom_hash)
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            raise SystemExit(f"Cannot start at {current_stage}: {exc}") from exc
+    elif current_stage != "starter":
+        # Dry-run still refuses absent or mismatched prerequisite metadata; it does
+        # not need to open the emulator or inspect the raw savestate bytes.
+        try:
+            validate_stage_start_state(root, current_stage, current_stage_start_state, expected_rom_hash)
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            raise SystemExit(f"Cannot plan {current_stage}: {exc}") from exc
 
     print("=" * 72, flush=True)
     print(" Pokémon Emerald curriculum controller", flush=True)
     print(f" ROM expected SHA-1 : {expected_rom_hash}", flush=True)
     print(f" Model checkpoint   : {checkpoint}", flush=True)
+    print(f" Canonical starter  : {initial_state}", flush=True)
+    print(f" Selected stage     : {current_stage}", flush=True)
     if stage_only:
         print(" Mode                : STAGE-ONLY (evaluation, archive comparison, and promotion disabled)", flush=True)
     else:
@@ -696,7 +895,7 @@ def main() -> int:
         print("\n[Dry-run] No emulator will be started and no files/checkpoints will be changed.", flush=True)
         if stage_only:
             stage = current_stage
-            stage_start = initial_state if stage == "starter" else milestone_dir / f"{STAGES[STAGES.index(stage)-1]}.state"
+            stage_start = stage_start_state_path(root, stage, initial_state)
             print(f"\n[Dry-run] STAGE-ONLY: {stage} — {OBJECTIVE_LABELS[stage]}", flush=True)
             print(f"  Start state       : {stage_start}", flush=True)
             print(f"  Training chunks   : {max_chunks} × {chunk_steps:,} = {max_chunks * chunk_steps:,} transitions", flush=True)
@@ -706,7 +905,7 @@ def main() -> int:
             print("\n[Dry-run] Stage-only plan preview complete (exit 0).", flush=True)
             return 0
         for stage in STAGES[start_index:]:
-            stage_start = initial_state if stage == "starter" else milestone_dir / f"{STAGES[STAGES.index(stage)-1]}.state"
+            stage_start = stage_start_state_path(root, stage, initial_state)
             print(f"\n[Dry-run] Stage {stage}: start state={stage_start}", flush=True)
             if checkpoint.is_file():
                 print(f"  1. Evaluate current checkpoint ({eval_episodes} episodes): {checkpoint}", flush=True)
@@ -745,7 +944,14 @@ def main() -> int:
     base_env["POKEMON_AI_EVAL_EPISODES"] = str(eval_episodes)
     base_env["POKEMON_AI_EVAL_DETERMINISTIC"] = "1" if deterministic else "0"
     base_env["POKEMON_AI_REQUIRE_START_STATE"] = "1"
+    base_env["POKEMON_AI_CANONICAL_START_STATE"] = str(initial_state)
     base_env["POKEMON_AI_CURRICULUM_STAGE_ONLY"] = "1" if stage_only else "0"
+    base_env["POKEMON_AI_SHUTDOWN_TIMEOUT"] = os.environ.get(
+        "POKEMON_AI_SHUTDOWN_TIMEOUT", cfg.get("POKEMON_AI_SHUTDOWN_TIMEOUT", "900")
+    )
+    base_env["POKEMON_AI_SHUTDOWN_TERMINATE_TIMEOUT"] = os.environ.get(
+        "POKEMON_AI_SHUTDOWN_TERMINATE_TIMEOUT", cfg.get("POKEMON_AI_SHUTDOWN_TERMINATE_TIMEOUT", "60")
+    )
 
     def eval_stage(
         stage: str,
@@ -898,21 +1104,8 @@ def main() -> int:
     try:
         if stage_only:
             stage = current_stage
-            if stage == "starter":
-                stage_start_state = initial_state
-            else:
-                prior = STAGES[STAGES.index(stage) - 1]
-                stage_start_state = milestone_dir / f"{prior}.state"
-                manifest_path = Path(str(stage_start_state) + ".json")
-                if not stage_start_state.is_file() or not manifest_path.is_file():
-                    raise RuntimeError(
-                        f"Stage-only training for {stage} requires the prior {prior} milestone and metadata: {stage_start_state}"
-                    )
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                if manifest.get("objective") != prior or manifest.get("rom_sha1_expected") != expected_rom_hash:
-                    raise RuntimeError(f"Milestone metadata does not match required objective/ROM: {manifest_path}")
-            if not stage_start_state.is_file():
-                raise FileNotFoundError(f"Required start state is missing: {stage_start_state}")
+            stage_start_state = stage_start_state_path(root, stage, initial_state)
+            validate_stage_start_state(root, stage, stage_start_state, expected_rom_hash)
 
             stage_message = (
                 f"[Stage-only] TRAINING {stage.upper()}: {OBJECTIVE_LABELS[stage]} | "
@@ -975,19 +1168,8 @@ def main() -> int:
 
         for stage_index in range(start_index, len(STAGES)):
             stage = STAGES[stage_index]
-            if stage == "starter":
-                stage_start_state = initial_state
-            else:
-                prior = STAGES[stage_index - 1]
-                stage_start_state = milestone_dir / f"{prior}.state"
-                manifest_path = Path(str(stage_start_state) + ".json")
-                if not stage_start_state.is_file() or not manifest_path.is_file():
-                    raise RuntimeError(
-                        f"Stage {stage} requires the prior {prior} milestone and metadata: {stage_start_state}"
-                    )
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                if manifest.get("objective") != prior or manifest.get("rom_sha1_expected") != expected_rom_hash:
-                    raise RuntimeError(f"Milestone metadata does not match required objective/ROM: {manifest_path}")
+            stage_start_state = stage_start_state_path(root, stage, initial_state)
+            validate_stage_start_state(root, stage, stage_start_state, expected_rom_hash)
 
             stage_message = f"[Curriculum] STAGE {stage.upper()}: {OBJECTIVE_LABELS[stage]} | start={stage_start_state}"
             print(f"\n{stage_message}", flush=True)

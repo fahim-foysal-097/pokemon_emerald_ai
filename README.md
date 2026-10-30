@@ -140,3 +140,54 @@ Run tests in the project's virtual environment:
 ```
 
 Unit tests use mocked RAM and temporary checkpoints; they do not replace a live smoke test with the local ROM and mGBA binding. Review source changes with Git and validate stage transitions before relying on long runs.
+
+
+## Train / interrupt
+
+The supplied `.env` keeps the previous one-chunk starter-stage budget: 245,760 transitions. To run it:
+
+```bash
+.venv/bin/python run_curriculum.py --start-stage starter --stage-only
+```
+
+The stage-only controller will run exactly one chunk by default, not silently run eight 250,000-step chunks. For a different duration, first let the configurator calculate and write a rollout-aligned budget; for example:
+
+```bash
+.venv/bin/python configure_training.py --hours 1 --mode stage-only --stage starter --yes
+```
+
+Then launch the stage-only command above. The configurator updates the duration, episode cap, checkpoint and progress intervals consistently. Press Ctrl+C once to request a safe stop. Look for output similar to:
+
+```text
+[Interrupt] SIGINT received. Finishing the current full PPO rollout and optimizer update...
+[Checkpoint] Interrupt model atomically saved after a completed PPO update...
+[Interrupt] Safe checkpoint completed...
+```
+
+The controller should then report that the child exited normally. If it reports SIGTERM/SIGKILL escalation, inspect the child log and do not assume the last update was saved.
+
+To inspect a saved model without training:
+
+```bash
+.venv/bin/python - <<'PY'
+from sb3_contrib import RecurrentPPO
+model = RecurrentPPO.load('emerald_ppo_hybrid_v1.zip', device='cpu')
+print('timesteps:', model.num_timesteps)
+print('PPO updates:', model._n_updates)
+PY
+```
+
+## Training parameters (what they mean)
+
+The current policy is about **5.88 million trainable parameters**. A parameter is a learned floating-point weight or bias inside the neural network. PPO updates those values using the policy and value losses; the number is not a target or an amount of training data. The checkpoint also stores Adam's moment estimates for the trainable tensors; those optimizer values are state, not additional trainable model parameters.
+
+The input is a Dict observation:
+
+- Screen image: 3 × 80 × 120 pixels, processed into 256 CNN features.
+- Visited-tile memory: 64 × 64 = 4,096 values.
+- Structured RAM/game state: 61 values.
+- Combined feature vector: 4,413 values.
+
+The actor and critic each use a one-layer LSTM with 128 hidden units, followed by `[128, 128]` MLP layers. The policy selects among nine actions: WAIT, UP, DOWN, LEFT, RIGHT, A, B, START, SELECT.
+
+The 4,413 feature count is **not** the model's parameter count. Increasing LSTM width, CNN channels, or MLP widths increases trainable parameters and compute, but does not automatically make the agent smarter. On the Ryzen 5 5600G, PPO optimization is already the major runtime cost. Do not increase parameters until evaluation results show a specific representational limitation. Preserve the existing checkpoint and use a separate model name for any future architecture experiment.

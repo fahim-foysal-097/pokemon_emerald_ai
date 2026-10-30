@@ -24,9 +24,9 @@ from collections import Counter, deque
 
 from important_logging import filter_persistent_log_text, should_flush_important_log, is_exception_end
 from curriculum_objectives import (
-    OBJECTIVE_DEFINITIONS,
+    OBJECTIVE_DEFINITIONS, STAGES,
     ROUTE_101_MAP_ID, objective_satisfied as _objective_satisfied,
-    objective_start_error,
+    objective_start_error, resolve_runtime_start_state_path,
 )
 
 
@@ -56,6 +56,7 @@ def _load_project_env_file():
         return
 
     loaded_keys = []
+    important_overrides = []
     try:
         with open(env_path, "r", encoding="utf-8") as env_file:
             for raw_line in env_file:
@@ -80,10 +81,21 @@ def _load_project_env_file():
                     os.environ[key] = value
                     loaded_keys.append(key)
                     _PROJECT_ENV_KEYS_LOADED.add(key)
+                elif key in {"POKEMON_AI_OBJECTIVE", "POKEMON_AI_CURRICULUM_STAGE_ONLY"}:
+                    shell_value = os.environ[key].strip()
+                    file_value = value.strip()
+                    if shell_value.lower() != file_value.lower():
+                        important_overrides.append((key, shell_value, file_value))
         if loaded_keys:
             print(
                 f"[Config] Loaded {len(loaded_keys)} setting(s) from {env_path}; "
                 "existing shell variables take precedence.",
+                flush=True,
+            )
+        for key, shell_value, file_value in important_overrides:
+            print(
+                f"[Config Warning] Shell environment overrides .env: {key}={shell_value!r}; "
+                f".env contains {file_value!r}. The shell value is active.",
                 flush=True,
             )
     except OSError as exc:
@@ -545,6 +557,7 @@ _configure_opencv_qt_backend()
 
 import cv2
 import numpy as np
+from runtime_profiler import RuntimeProfiler
 import gymnasium as gym
 from gymnasium import spaces
 
@@ -735,7 +748,7 @@ if __name__ in {"__main__", "__mp_main__"}:
 try:
     # RecurrentPPO uses an LSTM policy so the agent can use recent observations and
     # actions to interpret multi-step dialogues, menus, and battles.
-    from sb3_contrib import RecurrentPPO as PPO
+    from sb3_contrib import RecurrentPPO
 except ImportError as exc:
     raise ImportError(
         "This project version uses RecurrentPPO. Install the matching SB3-Contrib package "
@@ -784,12 +797,12 @@ RESUME_TRAINING = os.environ.get("POKEMON_AI_RESUME", "1").strip().lower() not i
 LEGACY_CHECKPOINT_STATE = os.path.join(BASE_DIR, "emerald_save.state")
 CHECKPOINT_STATE = os.path.join(STATE_DIR, "emerald_save.state")
 _DEFAULT_TRAINING_START_STATE = os.path.join(STATE_DIR, "training_start.state")
-_configured_start_state = os.environ.get("POKEMON_AI_TRAINING_START_STATE", _DEFAULT_TRAINING_START_STATE).strip()
-TRAINING_START_STATE = (
-    _configured_start_state
-    if os.path.isabs(_configured_start_state)
-    else os.path.join(BASE_DIR, _configured_start_state)
+# This is stage-specific when explicitly configured. Resolve the stage-aware
+# fallback after OBJECTIVE_NAME is known, using the shared curriculum mapping.
+_configured_start_state = os.path.expanduser(
+    os.environ.get("POKEMON_AI_TRAINING_START_STATE", "").strip()
 )
+TRAINING_START_STATE = _DEFAULT_TRAINING_START_STATE  # replaced after OBJECTIVE_NAME is resolved
 REQUIRE_TRAINING_START_STATE = os.environ.get(
     "POKEMON_AI_REQUIRE_START_STATE", "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
@@ -981,6 +994,46 @@ if OBJECTIVE_NAME not in OBJECTIVE_DEFINITIONS:
         "POKEMON_AI_OBJECTIVE must be one of: " + ", ".join(OBJECTIVE_DEFINITIONS)
     )
 OBJECTIVE_LABEL = OBJECTIVE_DEFINITIONS[OBJECTIVE_NAME]["label"]
+
+
+def _start_state_recovery_hint() -> str:
+    """Give the recovery action appropriate to the selected curriculum stage."""
+    stage_index = STAGES.index(OBJECTIVE_NAME)
+    if stage_index == 0:
+        return (
+            "Recreate the pre-starter Route 101 state with ./run.sh --profile setup, "
+            "then press K after setting the clock and before obtaining a starter."
+        )
+    previous_stage = STAGES[stage_index - 1]
+    return (
+        f"The required input is the verified {previous_stage} milestone. Use run_curriculum.py "
+        f"to complete/evaluate {previous_stage} and publish its milestone; do not substitute "
+        "the canonical pre-starter state or a different stage save."
+    )
+
+
+# Start-state selection is centralized with the curriculum stage definitions.
+# Setup always targets the canonical Route 101 save; other modes require the
+# configured stage-specific path to match the preceding verified milestone.
+TRAINING_START_STATE = str(resolve_runtime_start_state_path(
+    BASE_DIR,
+    OBJECTIVE_NAME,
+    mode=MODE,
+    canonical_start_state=os.environ.get("POKEMON_AI_CANONICAL_START_STATE", "").strip() or None,
+    training_start_state=_configured_start_state or None,
+))
+
+if MODE == "setup" and _configured_start_state:
+    _configured_setup_state = os.path.expanduser(_configured_start_state)
+    if not os.path.isabs(_configured_setup_state):
+        _configured_setup_state = os.path.join(BASE_DIR, _configured_setup_state)
+    if os.path.realpath(_configured_setup_state) != os.path.realpath(TRAINING_START_STATE):
+        print(
+            "[Setup Config] Ignoring stage-specific POKEMON_AI_TRAINING_START_STATE="
+            f"{os.path.realpath(_configured_setup_state)}; setup saves only to the canonical "
+            f"Route 101 state {TRAINING_START_STATE}.",
+            flush=True,
+        )
 
 
 def _decode_gen3_growth_words(personality, ot_id, encrypted_species_item, encrypted_experience):
@@ -1289,12 +1342,26 @@ VIDEO_AUDIO_TEMP_PATH = os.path.join(TEMP_DIR, _VIDEO_BASENAME + ".audio.tmp.wav
 # PPO transition count between periodic checkpoints. Override with POKEMON_AI_CHECKPOINT_EVERY.
 # Default to a much less frequent checkpoint cadence. configure_training.py aligns this
 # with the active vector rollout; this fallback is for direct launch without the configurator.
-CHECKPOINT_SAVE_FREQUENCY = int(os.environ.get("POKEMON_AI_CHECKPOINT_EVERY", "122880"))
+_REQUESTED_CHECKPOINT_SAVE_FREQUENCY = int(os.environ.get("POKEMON_AI_CHECKPOINT_EVERY", "122880"))
 CHECKPOINT_ARCHIVE_KEEP = int(os.environ.get("POKEMON_AI_CHECKPOINT_KEEP", "20"))
 LATEST_CHECKPOINT_BACKUP_ENABLED = _env_flag("POKEMON_AI_LATEST_BACKUP_ENABLED", True)
-PROGRESS_LOG_FREQUENCY = int(os.environ.get("POKEMON_AI_PROGRESS_EVERY", "5000"))
-if CHECKPOINT_SAVE_FREQUENCY < 1:
+PROGRESS_LOG_FREQUENCY = int(os.environ.get("POKEMON_AI_PROGRESS_EVERY", "8192"))
+if _REQUESTED_CHECKPOINT_SAVE_FREQUENCY < 1:
     raise ValueError("POKEMON_AI_CHECKPOINT_EVERY must be a positive integer")
+# A model checkpoint must never be written from the middle of collect_rollouts().
+# Round the requested cadence up to whole vector rollouts; SafeRecurrentPPO only
+# publishes a due checkpoint after the matching optimizer update has completed.
+VECTOR_ROLLOUT_TRANSITIONS = NUM_CPU * PPO_N_STEPS
+CHECKPOINT_SAVE_FREQUENCY = (
+    (_REQUESTED_CHECKPOINT_SAVE_FREQUENCY + VECTOR_ROLLOUT_TRANSITIONS - 1)
+    // VECTOR_ROLLOUT_TRANSITIONS
+) * VECTOR_ROLLOUT_TRANSITIONS
+if CHECKPOINT_SAVE_FREQUENCY != _REQUESTED_CHECKPOINT_SAVE_FREQUENCY:
+    print(
+        f"[Checkpoint] Requested interval {_REQUESTED_CHECKPOINT_SAVE_FREQUENCY:,} was aligned "
+        f"to {CHECKPOINT_SAVE_FREQUENCY:,} transitions ({VECTOR_ROLLOUT_TRANSITIONS:,} per PPO rollout).",
+        flush=True,
+    )
 if CHECKPOINT_ARCHIVE_KEEP < 0:
     raise ValueError("POKEMON_AI_CHECKPOINT_KEEP must be >= 0 (0 disables rolling snapshots)")
 if PROGRESS_LOG_FREQUENCY < 1:
@@ -1438,8 +1505,13 @@ tb_process = None
 tb_owned = False
 tb_log_handle = None
 STOP_REQUESTED = False
+STOP_SIGNAL_NAME = None
+SAFE_STOP_AFTER_UPDATE = False
+ACTIVE_TRAINING_CALLBACK = None
 LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP = None
 LAST_SUCCESSFUL_EMULATOR_SAVE_TIMESTEP = None
+LAST_COMPLETED_UPDATE_TIMESTEP = None
+PPO_UPDATE_FAILED = False
 
 
 class SessionTimer:
@@ -1948,6 +2020,7 @@ class EmeraldEnv(gym.Env):
         # Known SaveBlock1 party-count mismatch signatures are logged once per worker,
         # not once per short successful training episode.
         self._last_party_debug_signature = None
+        self._pending_reset_elapsed_ms = 0.0
         self._cached_trainer_flags = set()
         self._training_success_logged_once = False
         self._terminal_episode_count = 0
@@ -3021,18 +3094,20 @@ class EmeraldEnv(gym.Env):
                     print("[Setup] Ignoring existing emulator checkpoints; cold-booting for manual setup.", flush=True)
                 elif os.path.isfile(TRAINING_START_STATE):
                     if self.env_id == 0 or VERBOSE_LEVEL >= 2:
-                        print(f"[Start State] Loading canonical training start: {TRAINING_START_STATE}", flush=True)
+                        print(
+                            f"[Start State] Loading mapped start state for objective={OBJECTIVE_NAME}: "
+                            f"{TRAINING_START_STATE}", flush=True
+                        )
                     restored_checkpoint = self._load_state_file(TRAINING_START_STATE)
                     if not restored_checkpoint:
                         raise RuntimeError(
-                            f"Training start savestate exists but could not be loaded: {TRAINING_START_STATE}. "
-                            "Recreate it with ./run.sh --profile setup and press K on Route 101 before obtaining a starter."
+                            f"Mapped stage-start savestate exists but could not be loaded: {TRAINING_START_STATE}. "
+                            f"{_start_state_recovery_hint()}"
                         )
                 elif MODE in {"train", "evaluate", "watch"} and REQUIRE_TRAINING_START_STATE:
                     raise FileNotFoundError(
-                        f"Required training start savestate not found: {TRAINING_START_STATE}\n"
-                        f"Run ./run.sh --profile setup and follow the instructions for Route 101 task, "
-                        "then press K to save the training start state."
+                        f"Required mapped stage-start savestate not found: {TRAINING_START_STATE}\n"
+                        f"{_start_state_recovery_hint()}"
                     )
                 elif MODE != "setup" and os.path.isfile(self.checkpoint_file):
                     print(f"[Load] Attempting legacy emulator checkpoint: {self.checkpoint_file}", flush=True)
@@ -3044,21 +3119,21 @@ class EmeraldEnv(gym.Env):
                     _debug_log("[Reset] Checkpoint restored; refreshing one frame.", flush=True)
                     self._advance_frame_for_observation(1)
                     if MODE in {"train", "watch", "evaluate"} and os.path.isfile(TRAINING_START_STATE):
-                        # Validate the canonical Route 101 pre-starter state.
+                        # Validate the loaded live game state against this objective's prerequisites.
                         try:
                             start_state = self._read_game_state()
                         except Exception as exc:
                             raise RuntimeError(
-                                f"Training start state is not readable as an active Emerald game: {exc}. "
-                                "Recreate it with ./run.sh --profile setup."
+                                f"Mapped stage-start state is not readable as an active Emerald game: {exc}. "
+                                f"{_start_state_recovery_hint()}"
                             ) from exc
                         validation_error = _training_start_validation_error(
                             start_state, objective=OBJECTIVE_NAME
                         )
                         if validation_error:
                             raise RuntimeError(
-                                f"Training start state is invalid: {validation_error}. "
-                                "Recreate it with ./run.sh --profile setup and press K."
+                                f"Mapped stage-start state is invalid for objective={OBJECTIVE_NAME}: "
+                                f"{validation_error}. {_start_state_recovery_hint()}"
                             )
                         if self.env_id == 0 or VERBOSE_LEVEL >= 2:
                             print(
@@ -3125,7 +3200,12 @@ class EmeraldEnv(gym.Env):
             )
             return obs, {"episode_step": self.episode_step_counter}
         finally:
+            if TIMING_DIAGNOSTICS and MODE == "train":
+                self._pending_reset_elapsed_ms = max(
+                    0.0, time.perf_counter() - reset_started
+                ) * 1000.0
             faulthandler.cancel_dump_traceback_later()
+
     def step(self, action):
         timing_enabled = bool(TIMING_DIAGNOSTICS and MODE == "train")
         step_started = time.perf_counter() if timing_enabled else 0.0
@@ -3238,6 +3318,9 @@ class EmeraldEnv(gym.Env):
             "mini_episode_boundary": False,
             "mini_episode_count": int(getattr(self, "mini_episode_count", 0)),
         }
+        if timing_enabled:
+            info["timing_reset_ms"] = float(getattr(self, "_pending_reset_elapsed_ms", 0.0))
+            self._pending_reset_elapsed_ms = 0.0
         terminated = False
         if current_screen_signature is not None:
             self.screen_signature_history.append(current_screen_signature)
@@ -3294,9 +3377,9 @@ class EmeraldEnv(gym.Env):
                             ("Starter flag", str(starter_flag_set)),
                         ]
                         print("\n" + _format_progress_table("PARTY RAM DIAGNOSTIC — LIVE COUNT IS AUTHORITATIVE", party_rows, width=None), flush=True)
-                else:
-                    # If the mismatch clears, a later recurrence should be reported again.
-                    self._last_party_debug_signature = None
+                # Keep the last reported mismatch signature even if the mismatch clears.
+                # A canonical episode reset can briefly restore matching party counts; clearing
+                # this guard here would print the same static mismatch again every episode.
 
                 # Level/party progress is delta-based and cannot be farmed by standing still.
                 previous_party_levels = self.prev_party_levels
@@ -4071,8 +4154,8 @@ def atomic_save_model(model, checkpoint_base=MODEL_CHECKPOINT):
         except (TypeError, ValueError, OverflowError):
             LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP = None
         return final_path
-    except Exception:
-        # Keep the previous final checkpoint untouched. Remove only our known temp path.
+    except BaseException:
+        # Keep the previous final checkpoint untouched, even on an interrupted write. Remove only our known temp path.
         try:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -4221,10 +4304,16 @@ def start_tensorboard():
 
 # --- Graceful Exit Handler ---
 def handle_exit(sig, frame):
-    global STOP_REQUESTED
-    # Do not call sys.exit() here: let the training/watch loop save models and emulator state in its finally block.
+    """Request a safe stop; never unwind the active rollout/update from a signal handler."""
+    global STOP_REQUESTED, STOP_SIGNAL_NAME
     STOP_REQUESTED = True
-    print("\n[Interrupt] Stop requested. Saving checkpoints and cleaning up resources...")
+    try:
+        STOP_SIGNAL_NAME = signal.Signals(sig).name
+    except (ValueError, TypeError):
+        STOP_SIGNAL_NAME = str(sig)
+    # The training callback observes this flag, finishes the current full PPO rollout,
+    # waits for its optimizer update, and only then saves. Printing/I/O is deferred to
+    # normal callback code rather than performed inside the signal handler.
 
 
 signal.signal(signal.SIGINT, handle_exit)
@@ -4253,14 +4342,17 @@ def _actor_state_numpy(recurrent_state):
 class StopAndCheckpointCallback(BaseCallback):
     """Report actionable progress, log metrics to TensorBoard, and checkpoint safely."""
 
-    def __init__(self, save_frequency=CHECKPOINT_SAVE_FREQUENCY, verbose=0):
+    def __init__(self, save_frequency=CHECKPOINT_SAVE_FREQUENCY, verbose=0, runtime_profiler=None):
         super().__init__(verbose)
+        self.runtime_profiler = runtime_profiler
         self.save_frequency = max(1, int(save_frequency))
         self.progress_frequency = max(1, int(PROGRESS_LOG_FREQUENCY))
         self.terminal_progress_frequency = max(
             self.progress_frequency, TERMINAL_PROGRESS_FREQUENCY
         )
         self._last_save_timestep = 0
+        self._checkpoint_due = False
+        self._stop_notice_printed = False
         self._last_progress_timestep = 0
         self._last_terminal_progress_timestep = 0
         self._run_start_timestep = 0
@@ -4294,10 +4386,26 @@ class StopAndCheckpointCallback(BaseCallback):
         self._timeouts = 0
         self._timing_sums = Counter()
         self._timing_samples = 0
+        self._timing_reset_sum_ms = 0.0
+        self._timing_reset_samples = 0
 
     def _on_training_start(self):
+        global ACTIVE_TRAINING_CALLBACK, SAFE_STOP_AFTER_UPDATE
+        global LAST_COMPLETED_UPDATE_TIMESTEP, LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP, PPO_UPDATE_FAILED
         # On resumed training, num_timesteps can already be very large. Anchor the
         # interval to this run's starting value so we do not save again on its first step.
+        ACTIVE_TRAINING_CALLBACK = self
+        SAFE_STOP_AFTER_UPDATE = False
+        LAST_COMPLETED_UPDATE_TIMESTEP = int(self.num_timesteps)
+        PPO_UPDATE_FAILED = False
+        if (
+            LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP is None
+            and os.path.isfile(f"{MODEL_CHECKPOINT}.zip")
+        ):
+            # A resumed model's existing file is the known-good recovery baseline.
+            LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP = int(self.num_timesteps)
+        self._checkpoint_due = False
+        self._stop_notice_printed = False
         self._run_start_timestep = int(self.num_timesteps)
         self._last_save_timestep = int(self.num_timesteps)
         self._last_progress_timestep = int(self.num_timesteps)
@@ -4409,6 +4517,7 @@ class StopAndCheckpointCallback(BaseCallback):
             self._last_greedy_probe_timestep = timestep
 
     def _on_step(self):
+        global STOP_REQUESTED
         rewards = np.asarray(self.locals.get("rewards", []), dtype=np.float64).reshape(-1)
         self._probe_greedy_actions()
         if rewards.size:
@@ -4449,6 +4558,10 @@ class StopAndCheckpointCallback(BaseCallback):
                         self._timing_sums[timing_key] += timing_value
                 if "timing_env_ms" in info:
                     self._timing_samples += 1
+                reset_ms = _finite_number(info.get("timing_reset_ms"))
+                if reset_ms is not None and reset_ms > 0:
+                    self._timing_reset_sum_ms += reset_ms
+                    self._timing_reset_samples += 1
 
         # Treat episode aggregates as terminal-only data. Per-step component sums are
         # cumulative within an episode and must never be sampled as if they were final.
@@ -4794,9 +4907,15 @@ class StopAndCheckpointCallback(BaseCallback):
                     timing_parts.append(f"{label}={average_ms:.2f}ms")
                     metric_name = timing_key.removeprefix("timing_").removesuffix("_ms")
                     self.logger.record(f"timing/{metric_name}", float(average_ms))
+                if self._timing_reset_samples:
+                    reset_mean = self._timing_reset_sum_ms / self._timing_reset_samples
+                    timing_parts.append(f"reset={reset_mean:.1f}ms/call")
+                    self.logger.record("timing/reset_mean_ms", float(reset_mean))
                 timing_row = ("Step timing (worker mean)", " | ".join(timing_parts))
                 self._timing_sums.clear()
                 self._timing_samples = 0
+                self._timing_reset_sum_ms = 0.0
+                self._timing_reset_samples = 0
 
             rows = [
                 ("Objective", f"{OBJECTIVE_LABEL} | mode={'GUI' if GUI_MODE else 'HEADLESS'} | action={action_text}"),
@@ -4823,6 +4942,13 @@ class StopAndCheckpointCallback(BaseCallback):
             ]
             if timing_row is not None:
                 rows.append(timing_row)
+            if TIMING_DIAGNOSTICS and self.runtime_profiler is not None:
+                parent_rows = self.runtime_profiler.format_rows()
+                rows.extend(parent_rows)
+                for metric_name, values in self.runtime_profiler.snapshot().items():
+                    short_name = metric_name[:28]
+                    self.logger.record(f"timing/p_{short_name}_ms", float(values["mean_ms"]))
+                    self.logger.record(f"timing/p_{short_name}_calls", float(values["count"]))
             if int(self.num_timesteps) - self._last_terminal_progress_timestep >= self.terminal_progress_frequency:
                 print("\n" + _format_progress_table(
                     f"POKÉMON EMERALD RL — TRAINING PROGRESS — {run_transitions:,}/{run_target:,}", rows
@@ -4837,53 +4963,128 @@ class StopAndCheckpointCallback(BaseCallback):
                 print(f"[TensorBoard Warning] Could not flush progress metrics: {exc}", flush=True)
             self._last_progress_timestep = int(self.num_timesteps)
 
-        if STOP_REQUESTED:
-            return False
-
-        if GUI_MODE:
+        # Never stop collect_rollouts() mid-batch. Doing so makes SB3 leave the
+        # learning loop before train() and discards the rollout without a PPO update.
+        # A stop flag is latched here and acted on only after the complete update.
+        if GUI_MODE and not STOP_REQUESTED:
             try:
                 if any(self.training_env.get_attr("stop_requested")):
-                    return False
+                    STOP_REQUESTED = True
             except Exception:
                 pass
 
-        # Mark the attempt before I/O. A failure should not trigger a disk-heavy retry
-        # on every single step; the next attempt is at the next configured interval.
-        if int(self.num_timesteps) - self._last_save_timestep >= self.save_frequency:
-            checkpoint_timestep = int(self.num_timesteps)
-            self._last_save_timestep = checkpoint_timestep
-            try:
-                saved_model = atomic_save_model(self.model, MODEL_CHECKPOINT)
+        current_timestep = int(self.num_timesteps)
+        if current_timestep - self._last_save_timestep >= self.save_frequency:
+            self._checkpoint_due = True
+
+        if STOP_REQUESTED and not self._stop_notice_printed:
+            signal_label = STOP_SIGNAL_NAME or "GUI/stop request"
+            print(
+                f"\n[Interrupt] {signal_label} received. Finishing the current full PPO rollout "
+                "and optimizer update before checkpointing; this may take several minutes.",
+                flush=True,
+            )
+            self._stop_notice_printed = True
+        return True
+
+    def _save_after_optimizer_update(self):
+        """Publish due/interrupt checkpoints only after RecurrentPPO.train() returns."""
+        if not self._checkpoint_due and not STOP_REQUESTED:
+            return False
+
+        checkpoint_timestep = int(self.num_timesteps)
+        reason = "interrupt" if STOP_REQUESTED else "periodic"
+        try:
+            saved_model = atomic_save_model(self.model, MODEL_CHECKPOINT)
+        except Exception as exc:
+            # Keep the request latched. SafeRecurrentPPO will continue with another
+            # complete rollout/update and retry at the next safe boundary.
+            print(
+                f"[Checkpoint Error] Could not save the {reason} model checkpoint at "
+                f"{checkpoint_timestep:,}: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return False
+
+        self._last_save_timestep = checkpoint_timestep
+        self._checkpoint_due = False
+        print(
+            f"[Checkpoint] {reason.capitalize()} model atomically saved after a completed PPO update: "
+            f"{saved_model} | timesteps={checkpoint_timestep:,} | updates={getattr(self.model, '_n_updates', 'n/a')}.",
+            flush=True,
+        )
+        try:
+            archived_model = archive_model_checkpoint(saved_model, checkpoint_timestep)
+            if archived_model:
+                print(f"[Checkpoint Archive] Preserved snapshot: {archived_model}", flush=True)
+        except Exception as exc:
+            # The authoritative latest checkpoint is already safe; archive failure
+            # must not prevent emulator state saving or terminate training.
+            print(
+                f"[Checkpoint Archive Warning] Latest checkpoint is safe; snapshot failed: {exc}",
+                flush=True,
+            )
+
+        emulator_state_saved = _save_vector_env_state(self.training_env, checkpoint_timestep)
+        if STOP_REQUESTED:
+            if emulator_state_saved:
                 print(
-                    f"[Checkpoint] PPO model atomically saved to {saved_model} "
-                    f"at timestep {checkpoint_timestep:,}.",
+                    f"[Interrupt] Model, optimizer, and emulator savestates checkpointed at "
+                    f"timestep {checkpoint_timestep:,}. Training will now stop without another rollout.",
                     flush=True,
                 )
-            except Exception as exc:
-                print(f"[Checkpoint Warning] Could not save PPO model: {exc}", flush=True)
             else:
-                try:
-                    archived_model = archive_model_checkpoint(saved_model, checkpoint_timestep)
-                    if archived_model:
-                        print(f"[Checkpoint Archive] Preserved snapshot: {archived_model}", flush=True)
-                except Exception as exc:
-                    # The authoritative latest checkpoint is already safe; archive failure
-                    # must not prevent emulator state saving or terminate training.
-                    print(f"[Checkpoint Archive Warning] Latest checkpoint is safe; snapshot failed: {exc}", flush=True)
-                try:
-                    self.training_env.env_method("save_state")
-                    global LAST_SUCCESSFUL_EMULATOR_SAVE_TIMESTEP
-                    LAST_SUCCESSFUL_EMULATOR_SAVE_TIMESTEP = checkpoint_timestep
-                    print(
-                        f"[Checkpoint] Emulator savestate(s) saved at timestep {checkpoint_timestep:,}.",
-                        flush=True,
-                    )
-                except Exception as exc:
-                    print(
-                        f"[Checkpoint Warning] PPO model is saved, but an emulator savestate failed: {exc}",
-                        flush=True,
-                    )
-        return True
+                print(
+                    f"[Interrupt Warning] Model and optimizer are safely checkpointed at "
+                    f"timestep {checkpoint_timestep:,}, but one or more live emulator savestates "
+                    "could not be confirmed. The canonical stage start-state remains the recovery point.",
+                    flush=True,
+                )
+            return True
+        return False
+
+    def _on_training_end(self):
+        global ACTIVE_TRAINING_CALLBACK
+        if ACTIVE_TRAINING_CALLBACK is self:
+            ACTIVE_TRAINING_CALLBACK = None
+
+class SafeRecurrentPPO(RecurrentPPO):
+    """RecurrentPPO that only honors stop requests after a complete update is saved.
+
+    SB3 normally exits its learn loop if a callback returns False during rollout
+    collection. That behavior discards the partial rollout before PPO.train(). This
+    subclass keeps collection running to the rollout boundary, completes the optimizer
+    update, then asks the next collect_rollouts() call to stop.
+    """
+
+    def train(self):
+        global LAST_COMPLETED_UPDATE_TIMESTEP, PPO_UPDATE_FAILED, SAFE_STOP_AFTER_UPDATE
+        try:
+            result = super().train()
+        except BaseException:
+            # A failure halfway through PPO.train() may leave partially-applied optimizer
+            # epochs in memory. Do not publish that ambiguous state from main()'s finally.
+            PPO_UPDATE_FAILED = True
+            raise
+
+        # This marker advances only after all configured PPO epochs complete successfully.
+        LAST_COMPLETED_UPDATE_TIMESTEP = int(self.num_timesteps)
+        callback = ACTIVE_TRAINING_CALLBACK
+        if callback is not None:
+            stop_after_save = callback._save_after_optimizer_update()
+            if stop_after_save:
+                SAFE_STOP_AFTER_UPDATE = True
+        return result
+
+    def collect_rollouts(self, *args, **kwargs):
+        if SAFE_STOP_AFTER_UPDATE:
+            return False
+        return super().collect_rollouts(*args, **kwargs)
+
+
+# Keep the existing public symbol used throughout main.py and by project tests.
+PPO = SafeRecurrentPPO
+
 
 def _worker_state_path(env_id):
     """Give each emulator a separate savestate under runtime_data/states/."""
@@ -5095,6 +5296,7 @@ def _enable_run_log():
 if __name__ == "__main__":
     env = None
     model = None
+    runtime_profiler = None
     model_file_path = f"{MODEL_CHECKPOINT}.zip"
     run_log_handle = None
     original_stdout, original_stderr = sys.stdout, sys.stderr
@@ -5182,7 +5384,19 @@ if __name__ == "__main__":
                     f"[Training] RecurrentPPO: n_steps={PPO_N_STEPS}, batch={PPO_BATCH_SIZE}, "
                     f"gamma={PPO_GAMMA}, gae_lambda={PPO_GAE_LAMBDA}, "
                     f"entropy={ENTROPY_COEF_START}->{ENTROPY_COEF_END}, "
-                    f"episode_limit={MAX_EPISODE_STEPS} actions.",
+                    f"episode_limit={MAX_EPISODE_STEPS} actions, "
+                    f"safe_checkpoint_every={CHECKPOINT_SAVE_FREQUENCY:,} transitions "
+                    f"({CHECKPOINT_SAVE_FREQUENCY // VECTOR_ROLLOUT_TRANSITIONS} rollouts).",
+                    flush=True,
+                )
+
+            runtime_profiler = RuntimeProfiler(enabled=TIMING_DIAGNOSTICS)
+            if TIMING_DIAGNOSTICS:
+                installed = runtime_profiler.instrument_training(model, env, globals())
+                installed_names = ", ".join(name for name, active in installed.items() if active)
+                print(
+                    f"[Performance] Parent-process timing enabled; probes={installed_names or 'none'}. "
+                    "Timings are cumulative averages and include worker wait/IPC separately from worker step time.",
                     flush=True,
                 )
 
@@ -5190,36 +5404,75 @@ if __name__ == "__main__":
                 model.learn(
                     total_timesteps=TOTAL_TIMESTEPS,
                     reset_num_timesteps=False,
-                    callback=StopAndCheckpointCallback(),
+                    callback=StopAndCheckpointCallback(runtime_profiler=runtime_profiler),
                 )
             except KeyboardInterrupt:
                 # Retained as a fallback; the signal handler normally sets STOP_REQUESTED instead.
                 print("[Interrupt] KeyboardInterrupt received during training.")
             finally:
-                final_timestep = int(getattr(model, "num_timesteps", 0))
-                if (
-                    LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP == final_timestep
-                    and os.path.isfile(f"{MODEL_CHECKPOINT}.zip")
-                ):
+                observed_timestep = int(getattr(model, "num_timesteps", 0))
+                completed_timestep = LAST_COMPLETED_UPDATE_TIMESTEP
+
+                if PPO_UPDATE_FAILED:
+                    # The optimizer may have been interrupted between epochs. Keep the last
+                    # published checkpoint; an in-memory partial optimizer update is unsafe.
+                    final_timestep = int(LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP or 0)
                     print(
-                        f"[Save] Skipping duplicate final model/archive save; timestep {final_timestep:,} "
-                        "is already checkpointed.", flush=True
+                        "[Save Warning] PPO.train() failed before completing all epochs. "
+                        "The in-memory update is not being published; the previous atomic "
+                        "checkpoint is retained.", flush=True
+                    )
+                elif completed_timestep is None:
+                    final_timestep = int(LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP or 0)
+                    print(
+                        "[Save Warning] No completed PPO update boundary was recorded. "
+                        "No unverified model checkpoint will be published.", flush=True
                     )
                 else:
-                    try:
-                        saved_model = atomic_save_model(model, MODEL_CHECKPOINT)
-                        print(f"[Save] PPO model checkpoint atomically saved to {saved_model}", flush=True)
+                    final_timestep = int(completed_timestep)
+                    if observed_timestep != final_timestep:
+                        print(
+                            f"[Save Warning] Discarding {observed_timestep - final_timestep:,} collected-but-untrained "
+                            "transitions after an abnormal exit. Saving only the last completed PPO update.",
+                            flush=True,
+                        )
+                        model.num_timesteps = final_timestep
+
+                    if (
+                        LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP == final_timestep
+                        and os.path.isfile(f"{MODEL_CHECKPOINT}.zip")
+                    ):
+                        print(
+                            f"[Save] Skipping duplicate final model/archive save; timestep {final_timestep:,} "
+                            "is already checkpointed.", flush=True
+                        )
+                    else:
                         try:
-                            archived_model = archive_model_checkpoint(saved_model, final_timestep)
-                            if archived_model:
-                                print(f"[Checkpoint Archive] Preserved final snapshot: {archived_model}", flush=True)
-                        except Exception as archive_exc:
-                            print(f"[Checkpoint Archive Warning] Latest checkpoint is safe; final snapshot failed: {archive_exc}", flush=True)
-                    except Exception as e:
-                        print(f"[Save Error] Could not save PPO model checkpoint: {e}")
+                            saved_model = atomic_save_model(model, MODEL_CHECKPOINT)
+                            print(f"[Save] PPO model checkpoint atomically saved to {saved_model}", flush=True)
+                            try:
+                                archived_model = archive_model_checkpoint(saved_model, final_timestep)
+                                if archived_model:
+                                    print(f"[Checkpoint Archive] Preserved final snapshot: {archived_model}", flush=True)
+                            except Exception as archive_exc:
+                                print(f"[Checkpoint Archive Warning] Latest checkpoint is safe; final snapshot failed: {archive_exc}", flush=True)
+                        except Exception as e:
+                            print(f"[Save Error] Could not save PPO model checkpoint: {e}")
 
             if STOP_REQUESTED:
-                print("[Stopped] Training stopped by user request; checkpoint saved.")
+                if (
+                    not PPO_UPDATE_FAILED
+                    and LAST_SUCCESSFUL_MODEL_SAVE_TIMESTEP == final_timestep
+                    and os.path.isfile(f"{MODEL_CHECKPOINT}.zip")
+                ):
+                    print(f"[Stopped] Training stopped safely; checkpoint verified at timestep {final_timestep:,}.", flush=True)
+                else:
+                    print(
+                        f"[Stopped Warning] A verified checkpoint at the last completed PPO update "
+                        f"(timestep {final_timestep:,}) was not confirmed. Keep the previous checkpoint "
+                        "and inspect the save error above before resuming.",
+                        flush=True,
+                    )
             else:
                 print(f"[Complete] Training call finished. Model saved; configured timestep target was {TOTAL_TIMESTEPS}.")
 
@@ -5230,7 +5483,7 @@ if __name__ == "__main__":
                 f"objective={OBJECTIVE_LABEL} | episodes={EVAL_EPISODES} | "
                 f"max_steps={MAX_EPISODE_STEPS} | seed={EVAL_SEED}."
             )
-            print(" [MODE] Uses the canonical training start, no training updates, no GUI and no video.")
+            print(" [MODE] Uses the mapped start state for this objective; no training updates, no GUI and no video.")
             print("--------------------------------------------------", flush=True)
 
             eval_checkpoint_override = os.environ.get("POKEMON_AI_EVAL_CHECKPOINT", "").strip()
@@ -5559,7 +5812,7 @@ if __name__ == "__main__":
                 flush=True,
             )
             print(
-                f"[Watch] Plays from the canonical Route 101 start; after {OBJECTIVE_LABEL} "
+                f"[Watch] Plays from the mapped start state for {OBJECTIVE_LABEL}; after "
                 f"success it continues for {WATCH_SUCCESS_GRACE_STEPS} extra decision(s) "
                 "so the transition can be seen, then stops. Set "
                 "POKEMON_AI_WATCH_SUCCESS_GRACE_STEPS=0 to stop immediately.",
@@ -5690,6 +5943,11 @@ if __name__ == "__main__":
                 )
             else:
                 _save_vector_env_state(env, timestep=current_timestep)
+            if runtime_profiler is not None and TIMING_DIAGNOSTICS:
+                final_profile_rows = runtime_profiler.format_rows()
+                if final_profile_rows:
+                    print("\n" + _format_progress_table("FINAL PARENT-PROCESS PERFORMANCE PROFILE", final_profile_rows, width=None), flush=True)
+                runtime_profiler.restore()
             try:
                 env.close()
             except Exception as e:

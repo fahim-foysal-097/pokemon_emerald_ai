@@ -1,6 +1,7 @@
 import importlib.util
 import sys
 import tempfile
+import shutil
 import unittest
 from pathlib import Path
 
@@ -24,7 +25,13 @@ class ConfigureTrainingTests(unittest.TestCase):
             ct.StageInfo("pokedex", "obtain Pokédex", "Talk to Birch"),
             ct.StageInfo("first_badge", "first badge", "Long objective"),
         ]
-        self.project_dir = Path("/tmp/pokemon-ai-configurator-test")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.project_dir = Path(temporary.name)
+        shutil.copyfile(
+            Path(__file__).resolve().parents[1] / "curriculum_objectives.py",
+            self.project_dir / "curriculum_objectives.py",
+        )
 
     def build(self, **kwargs):
         base = dict(
@@ -65,6 +72,57 @@ class ConfigureTrainingTests(unittest.TestCase):
         self.assertEqual(int(values["POKEMON_AI_CHECKPOINT_EVERY"]) % plan.rollout_size, 0)
         self.assertEqual(int(values["POKEMON_AI_PROGRESS_EVERY"]) % plan.rollout_size, 0)
 
+    def test_starter_stage_always_uses_canonical_pre_starter_path(self):
+        plan = self.build(stage="starter")
+        self.assertTrue(plan.start_state.endswith("runtime_data/states/training_start.state"))
+        self.assertEqual(
+            ct.values_for_plan(plan)["POKEMON_AI_CANONICAL_START_STATE"],
+            "runtime_data/states/training_start.state",
+        )
+
+    def test_entire_curriculum_uses_the_immediately_preceding_milestone(self):
+        expected = {
+            "starter": "runtime_data/states/training_start.state",
+            "leave_birch_lab": "runtime_data/states/milestones/starter.state",
+            "reach_oldale": "runtime_data/states/milestones/leave_birch_lab.state",
+            "reach_route103": "runtime_data/states/milestones/reach_oldale.state",
+            "defeat_rival": "runtime_data/states/milestones/reach_route103.state",
+            "return_birch_lab": "runtime_data/states/milestones/defeat_rival.state",
+            "pokedex": "runtime_data/states/milestones/return_birch_lab.state",
+            "first_badge": "runtime_data/states/milestones/pokedex.state",
+        }
+        for stage, suffix in expected.items():
+            with self.subTest(stage=stage):
+                resolved = ct.stage_start_state(self.project_dir, self.stages, stage)
+                self.assertTrue(str(resolved).endswith(suffix), (stage, resolved))
+
+    def test_canonical_path_cannot_be_a_milestone_for_any_selected_stage(self):
+        for stage in ("starter", "leave_birch_lab", "first_badge"):
+            with self.subTest(stage=stage), self.assertRaisesRegex(ValueError, "cannot point inside"):
+                self.build(
+                    stage=stage,
+                    canonical_start_state="runtime_data/states/milestones/starter.state",
+                )
+
+    def test_later_stage_start_state_is_separate_from_canonical_start_state(self):
+        plan = self.build(
+            stage="leave_birch_lab",
+            canonical_start_state="runtime_data/states/training_start.state",
+        )
+        values = ct.values_for_plan(plan)
+        self.assertTrue(values["POKEMON_AI_TRAINING_START_STATE"].endswith("milestones/starter.state"))
+        self.assertEqual(
+            values["POKEMON_AI_CANONICAL_START_STATE"],
+            "runtime_data/states/training_start.state",
+        )
+
+    def test_checkpoint_interval_is_absolute_and_rounded_to_complete_rollout(self):
+        preserved = self.build(checkpoint_interval=122880)
+        self.assertEqual(preserved.checkpoint_every, 122880)
+        rounded = self.build(checkpoint_interval=10000)
+        self.assertEqual(rounded.checkpoint_every, 16384)
+        self.assertTrue(any("rounded up" in warning for warning in rounded.warnings))
+
     def test_curriculum_chunk_covers_longest_remaining_episode_and_rollout(self):
         plan = self.build(mode="curriculum", stage="reach_oldale")
         self.assertEqual(plan.max_episode_steps, 64 * 2048)  # first_badge is longest remaining
@@ -85,7 +143,7 @@ class ConfigureTrainingTests(unittest.TestCase):
         self.assertEqual(plan.total_transitions, expected_budget)
         self.assertEqual(int(values["POKEMON_AI_CURRICULUM_CHUNK_TIMESTEPS"]), expected_budget)
         self.assertEqual(values["POKEMON_AI_CURRICULUM_MAX_CHUNKS_PER_STAGE"], "1")
-        self.assertEqual(int(values["POKEMON_AI_CHECKPOINT_EVERY"]), 15 * plan.rollout_size)
+        self.assertEqual(int(values["POKEMON_AI_CHECKPOINT_EVERY"]), 122880)
         self.assertEqual(values["POKEMON_AI_LATEST_BACKUP_ENABLED"], "1")
 
     def test_stage_only_short_decimal_hours_change_budget_and_do_not_round_up_to_checkpoint(self):
@@ -99,9 +157,8 @@ class ConfigureTrainingTests(unittest.TestCase):
                 self.assertEqual(plan.curriculum_transitions, expected)
                 self.assertEqual(plan.chunks_per_stage, 1)
                 self.assertAlmostEqual(plan.estimated_hours, expected / 80 / 3600)
-                # A run shorter than the 15-rollout cadence should do only the final save.
-                self.assertEqual(int(values["POKEMON_AI_CHECKPOINT_EVERY"]), 15 * 8192)
-                self.assertGreater(int(values["POKEMON_AI_CHECKPOINT_EVERY"]), expected)
+                # The existing project interval remains independent of run duration.
+                self.assertEqual(int(values["POKEMON_AI_CHECKPOINT_EVERY"]), 122880)
 
     def test_stage_only_shorter_than_episode_cap_warns_without_extending_duration(self):
         plan = self.build(mode="stage-only", stage="leave_birch_lab", hours=0.2, speed=80)
@@ -120,6 +177,12 @@ class ConfigureTrainingTests(unittest.TestCase):
         self.assertEqual(values["POKEMON_AI_CURRICULUM_CHUNK_TIMESTEPS"], str(plan.total_transitions))
         self.assertEqual(values["POKEMON_AI_CURRICULUM_MAX_CHUNKS_PER_STAGE"], "1")
         self.assertEqual(values["POKEMON_AI_OBJECTIVE"], "leave_birch_lab")
+
+    def test_plan_configures_safe_interrupt_wait_windows(self):
+        plan = self.build(mode="stage-only")
+        values = ct.values_for_plan(plan)
+        self.assertEqual(values["POKEMON_AI_SHUTDOWN_TIMEOUT"], "900")
+        self.assertEqual(values["POKEMON_AI_SHUTDOWN_TERMINATE_TIMEOUT"], "60")
 
     def test_normal_modes_explicitly_disable_stage_only_flag(self):
         for mode in ("stage", "curriculum"):
@@ -148,6 +211,19 @@ class ConfigureTrainingTests(unittest.TestCase):
         self.assertIn("UNRELATED=keep", result)
         self.assertIn("# keep", result)
         self.assertIn("POKEMON_AI_MAX_EPISODE_STEPS=16384", result)
+
+    def test_legacy_stage_specific_milestone_is_not_adopted_as_canonical_path(self):
+        values = {"POKEMON_AI_TRAINING_START_STATE": "runtime_data/states/milestones/starter.state"}
+        canonical = ct.configured_canonical_start_state(self.project_dir, values)
+        self.assertEqual(canonical, "runtime_data/states/training_start.state")
+
+    def test_explicit_canonical_path_wins_over_stage_specific_path(self):
+        values = {
+            "POKEMON_AI_CANONICAL_START_STATE": "runtime_data/states/training_start.state",
+            "POKEMON_AI_TRAINING_START_STATE": "runtime_data/states/milestones/starter.state",
+        }
+        canonical = ct.configured_canonical_start_state(self.project_dir, values)
+        self.assertEqual(canonical, "runtime_data/states/training_start.state")
 
     def test_invalid_stage_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unknown stage"):

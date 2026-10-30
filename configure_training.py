@@ -7,26 +7,26 @@ shared curriculum_objectives.py for the project's actual ordered stage names.
 
 The stage-specific episode limits below are conservative starting heuristics,
 not measured guarantees. An episode step is one policy decision, not one GBA
-frame. At a stable four-environment aggregate speed of 80 transitions/s, each
-environment averages about 20 policy decisions/s.
+frame. At the current measured recurrent-policy speed of roughly 35 aggregate transitions/s, each
+environment averages about 8.75 policy decisions/s when four workers are balanced.
 
 Examples:
     # One hour of training for leaving Birch's Lab; preview only
     .venv/bin/python configure_training.py --project-dir /path/to/project \
-        --hours 1 --speed 80 --mode stage --stage leave_birch_lab --dry-run
+        --hours 1 --speed 35 --mode stage --stage leave_birch_lab --dry-run
 
     # Configure and write a 3-hour single-stage Pokédex run
     .venv/bin/python configure_training.py --project-dir /path/to/project \
-        --hours 3 --speed 80 --mode stage --stage pokedex --yes
+        --hours 3 --speed 35 --mode stage --stage pokedex --yes
 
     # Train exactly one selected curriculum stage with no evaluation or promotion
     .venv/bin/python configure_training.py --project-dir /path/to/project \
-        --hours 3 --speed 80 --mode stage-only --stage leave_birch_lab --dry-run
+        --hours 3 --speed 35 --mode stage-only --stage leave_birch_lab --dry-run
 
     # Start the automated curriculum at Route 103; note it shares one episode
     # timeout across the remaining stages in the current controller version
     .venv/bin/python configure_training.py --project-dir /path/to/project \
-        --hours 3 --speed 80 --mode curriculum --stage reach_route103 --dry-run
+        --hours 3 --speed 35 --mode curriculum --stage reach_route103 --dry-run
 """
 from __future__ import annotations
 
@@ -41,13 +41,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-DEFAULT_SPEED = 80.0  # most recently supplied aggregate speed
+DEFAULT_SPEED = 35.0  # current measured aggregate speed for the recurrent policy
 DEFAULT_NUM_ENVS = 4
 DEFAULT_N_STEPS = 2048
 DEFAULT_BATCH_SIZE = 256
 DEFAULT_EVAL_RESERVE = 0.20
 DEFAULT_MAX_CHUNKS_PER_STAGE = 8
-CHECKPOINT_ROLLOUTS = 15  # ~25.6 min at 80 aggregate transitions/s with four envs and 2048 steps/env
+DEFAULT_CHECKPOINT_INTERVAL_TRANSITIONS = 122_880  # preserved project default; 15 × (4 envs × 2048 steps)
 PROGRESS_ROLLOUTS = 1
 TERMINAL_PROGRESS_ROLLOUTS = 2
 
@@ -84,6 +84,8 @@ class Plan:
     stage: str
     stage_label: str
     start_state: str
+    canonical_start_state: str
+    checkpoint_every: int
     requested_hours: float
     speed: float
     envs: int
@@ -182,8 +184,8 @@ def detect_recent_speed(project_dir: Path) -> float | None:
     return None
 
 
-def load_stages(project_dir: Path) -> list[StageInfo]:
-    """Read the project's shared curriculum list/labels without importing main.py."""
+def load_curriculum_module(project_dir: Path):
+    """Load the shared objective module without importing the emulator runtime."""
     module_path = project_dir / "curriculum_objectives.py"
     if not module_path.is_file():
         raise ValueError(
@@ -194,6 +196,13 @@ def load_stages(project_dir: Path) -> list[StageInfo]:
         raise ValueError(f"Could not load curriculum stage definitions from {module_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def load_stages(project_dir: Path) -> list[StageInfo]:
+    """Read the project's shared curriculum list/labels without importing main.py."""
+    module = load_curriculum_module(project_dir)
+    module_path = project_dir / "curriculum_objectives.py"
     raw_stages = getattr(module, "STAGES", None)
     if not isinstance(raw_stages, (tuple, list)) or not raw_stages:
         raise ValueError(f"{module_path} does not define a non-empty STAGES list")
@@ -224,14 +233,24 @@ def stage_episode_rollouts(stage: str) -> int:
     return STAGE_EPISODE_ROLLOUTS.get(stage, DEFAULT_STAGE_EPISODE_ROLLOUTS)
 
 
-def stage_start_state(project_dir: Path, stages: list[StageInfo], stage: str) -> Path:
+def stage_start_state(
+    project_dir: Path,
+    stages: list[StageInfo],
+    stage: str,
+    canonical_start_state: str | Path = "runtime_data/states/training_start.state",
+) -> Path:
+    """Use the same stage-to-savestate mapping as run_curriculum.py."""
     keys = [item.key for item in stages]
     if stage not in keys:
         raise ValueError(f"Unknown stage {stage!r}; choose one of: {', '.join(keys)}")
-    index = keys.index(stage)
-    if index == 0:
-        return project_dir / "runtime_data" / "states" / "training_start.state"
-    return project_dir / "runtime_data" / "states" / "milestones" / f"{keys[index - 1]}.state"
+    module = load_curriculum_module(project_dir)
+    shared_keys = list(getattr(module, "STAGES", ()))
+    if keys != shared_keys:
+        raise ValueError(
+            "Configurator stage definitions do not match curriculum_objectives.py; "
+            "refusing to calculate a possibly incorrect savestate path."
+        )
+    return module.stage_start_state_path(project_dir, stage, canonical_start_state)
 
 
 def align_down(value: int, multiple: int) -> int:
@@ -253,6 +272,8 @@ def build_plan(
     eval_reserve: float = DEFAULT_EVAL_RESERVE,
     max_chunks_cap: int | None = None,
     episode_steps_override: int | None = None,
+    canonical_start_state: str | Path = "runtime_data/states/training_start.state",
+    checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL_TRANSITIONS,
 ) -> Plan:
     hours = positive_float(str(hours), "hours")
     speed = positive_float(str(speed), "aggregate transitions/s")
@@ -273,14 +294,23 @@ def build_plan(
     if stage not in stage_keys:
         raise ValueError(f"Unknown stage {stage!r}; choose one of: {', '.join(stage_keys)}")
     index = stage_keys.index(stage)
+    canonical_start_state = str(canonical_start_state).strip() or "runtime_data/states/training_start.state"
+    selected_start_state = stage_start_state(project_dir, stages, stage, canonical_start_state)
     remaining_stages = stages[index:]
     effective_envs = envs if (mode in {"curriculum", "stage-only"} or profile == "fast_train") else 1
     rollout_size = n_steps * effective_envs
     effective_batch = valid_batch_size(batch_size, rollout_size)
+    requested_checkpoint_interval = positive_int(str(checkpoint_interval), "checkpoint interval")
+    checkpoint_every = math.ceil(requested_checkpoint_interval / rollout_size) * rollout_size
     requested_total = int(hours * 3600 * speed)
     total_rollouts = max(1, requested_total // rollout_size)
     total_transitions = total_rollouts * rollout_size
     warnings: list[str] = []
+    if checkpoint_every != requested_checkpoint_interval:
+        warnings.append(
+            f"Checkpoint interval {requested_checkpoint_interval:,} was rounded up to {checkpoint_every:,} "
+            f"to align with complete {rollout_size:,}-transition PPO rollouts."
+        )
     if effective_batch != batch_size:
         warnings.append(
             f"PPO batch size {batch_size} does not divide the {rollout_size:,}-transition rollout; "
@@ -395,7 +425,9 @@ def build_plan(
         profile="fast_train" if mode in {"curriculum", "stage-only"} else profile,
         stage=stage,
         stage_label=next(item.label for item in stages if item.key == stage),
-        start_state=str(stage_start_state(project_dir, stages, stage)),
+        start_state=str(selected_start_state),
+        canonical_start_state=canonical_start_state,
+        checkpoint_every=checkpoint_every,
         requested_hours=hours,
         speed=speed,
         envs=effective_envs,
@@ -418,15 +450,13 @@ def build_plan(
 
 def values_for_plan(plan: Plan) -> dict[str, str]:
     rollout = plan.rollout_size
-    # Keep checkpoint cadence independent of run duration. When a run is shorter
-    # than 15 rollouts, no periodic checkpoint is fired before the requested budget;
-    # main.py's final save then writes the post-training model once at shutdown.
-    # Clamping this interval to total_transitions would save just before the final
-    # PPO optimization update, then could suppress the true final save as redundant.
-    checkpoint_every = CHECKPOINT_ROLLOUTS * rollout
+    # Keep the existing absolute checkpoint interval independent of run duration.
+    # main.py aligns it to full vector rollouts and writes only after the optimizer update.
+    checkpoint_every = plan.checkpoint_every
     values = {
         "POKEMON_AI_PROFILE": plan.profile,
         "POKEMON_AI_OBJECTIVE": plan.stage,
+        "POKEMON_AI_CANONICAL_START_STATE": plan.canonical_start_state,
         "POKEMON_AI_TRAINING_START_STATE": plan.start_state,
         "POKEMON_AI_RESUME": "1",
         "POKEMON_AI_MAX_EPISODE_STEPS": str(plan.max_episode_steps),
@@ -435,6 +465,8 @@ def values_for_plan(plan: Plan) -> dict[str, str]:
         "POKEMON_AI_TOTAL_TIMESTEPS": str(plan.total_transitions),
         "POKEMON_AI_CHECKPOINT_EVERY": str(checkpoint_every),
         "POKEMON_AI_LATEST_BACKUP_ENABLED": "1",
+        "POKEMON_AI_SHUTDOWN_TIMEOUT": "900",
+        "POKEMON_AI_SHUTDOWN_TERMINATE_TIMEOUT": "60",
         "POKEMON_AI_PROGRESS_EVERY": str(PROGRESS_ROLLOUTS * rollout),
         "POKEMON_AI_TERMINAL_PROGRESS_EVERY": str(TERMINAL_PROGRESS_ROLLOUTS * rollout),
     }
@@ -531,8 +563,8 @@ def print_plan(plan: Plan, replacements: dict[str, str], stage_infos: list[Stage
     print(f"Effective environments     : {plan.envs}")
     print(f"Estimated speed/environment: {per_env_speed:.2f} policy decisions/s (assuming balanced workers)")
     print(f"PPO rollout                : {plan.n_steps:,} × {plan.envs} = {plan.rollout_size:,} transitions")
-    checkpoint_every = int(replacements.get("POKEMON_AI_CHECKPOINT_EVERY", str(CHECKPOINT_ROLLOUTS * plan.rollout_size)))
-    print(f"Checkpoint cadence         : every {checkpoint_every:,} transitions (~{checkpoint_every / plan.speed / 60:.1f} min at entered speed)")
+    checkpoint_every = int(replacements.get("POKEMON_AI_CHECKPOINT_EVERY", str(plan.checkpoint_every)))
+    print(f"Checkpoint cadence         : every {checkpoint_every:,} transitions (~{checkpoint_every / plan.speed / 60:.1f} min at entered speed; saved after PPO update)")
     print("Checkpoint/archive saves   : old model/archive use hard links where supported; final duplicate saves are skipped")
     print(f"Total transition budget    : {plan.total_transitions:,} (~{plan.estimated_hours:.2f} h at entered speed)")
     print(f"Episode max                : {plan.max_episode_steps:,} decisions/environment")
@@ -559,6 +591,29 @@ def print_plan(plan: Plan, replacements: dict[str, str], stage_infos: list[Stage
         for warning in plan.warnings:
             print(f"  - {warning}")
     print("===========================================================\n")
+
+
+def configured_canonical_start_state(project_dir: Path, values: dict[str, str]) -> str:
+    """Resolve a stable starter state without reusing a later stage's selected state.
+
+    Older .env files only have POKEMON_AI_TRAINING_START_STATE. Reuse it as the
+    canonical state only when it is not inside the milestones directory.
+    """
+    configured = current_value(values, "POKEMON_AI_CANONICAL_START_STATE", "").strip()
+    if configured:
+        return configured
+
+    legacy = values.get("POKEMON_AI_TRAINING_START_STATE", "").strip()
+    if legacy:
+        legacy_path = Path(legacy).expanduser()
+        legacy_path = legacy_path.resolve() if legacy_path.is_absolute() else (project_dir / legacy_path).resolve()
+        milestone_root = (project_dir / "runtime_data" / "states" / "milestones").resolve()
+        try:
+            legacy_path.relative_to(milestone_root)
+        except ValueError:
+            return legacy
+
+    return "runtime_data/states/training_start.state"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -661,11 +716,19 @@ def main(argv: list[str] | None = None) -> int:
         if mode == "curriculum" and max_chunks_cap is None:
             max_chunks_cap = DEFAULT_MAX_CHUNKS_PER_STAGE
 
+        canonical_start_state = configured_canonical_start_state(project_dir, values)
+        # Use the persistent .env checkpoint interval, not a stale exported value
+        # from a shell that may have launched a previous run with an override.
+        checkpoint_interval = positive_int(
+            values.get("POKEMON_AI_CHECKPOINT_EVERY", str(DEFAULT_CHECKPOINT_INTERVAL_TRANSITIONS)),
+            "POKEMON_AI_CHECKPOINT_EVERY",
+        )
         plan = build_plan(
             mode=mode, profile=profile, stage=stage, stages=stage_infos, project_dir=project_dir,
             hours=hours, speed=speed, envs=envs, n_steps=n_steps, batch_size=batch,
             eval_reserve=args.evaluation_reserve, max_chunks_cap=max_chunks_cap,
-            episode_steps_override=args.episode_steps,
+            episode_steps_override=args.episode_steps, canonical_start_state=canonical_start_state,
+            checkpoint_interval=checkpoint_interval,
         )
         replacements = values_for_plan(plan)
         old_text = env_path.read_text(encoding="utf-8") if env_path.is_file() else ""
