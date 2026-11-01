@@ -23,8 +23,13 @@ class RuntimeProfiler:
         self._totals: dict[str, float] = defaultdict(float)
         self._counts: dict[str, int] = defaultdict(int)
         self._maxima: dict[str, float] = defaultdict(float)
-        self._patches: list[tuple[Any, str, Any]] = []
+        self._last_values: dict[str, float] = {}
+        self._patches: list[tuple[Any, ...]] = []
         self._installed = False
+
+    @property
+    def is_installed(self) -> bool:
+        return self._installed
 
     def record(self, metric: str, seconds: float) -> None:
         if not self.enabled:
@@ -35,6 +40,7 @@ class RuntimeProfiler:
             return
         self._totals[metric] += value
         self._counts[metric] += 1
+        self._last_values[metric] = value
         if value > self._maxima[metric]:
             self._maxima[metric] = value
 
@@ -133,7 +139,11 @@ class RuntimeProfiler:
             "vec_send": self._wrap_attribute(env, "step_async", "vec_send"),
             # This is wall time waiting for all workers + IPC/serialization.
             "vec_wait": self._wrap_attribute(env, "step_wait", "vec_wait"),
-            "ppo_update": self._wrap_attribute(model, "train", "ppo_update"),
+            # Do NOT wrap model.train on the model instance. SB3 serializes the
+            # model's __dict__; a closure stored there retains this profiler, the
+            # SubprocVecEnv and multiprocessing AuthenticationString objects.
+            # SafeRecurrentPPO.train records PPO duration explicitly instead.
+            "ppo_update": False,
             "tensorboard_dump": self._wrap_attribute(logger, "dump", "tensorboard_dump"),
             "env_method": self._wrap_env_method(env),
         }
@@ -152,6 +162,7 @@ class RuntimeProfiler:
                 "count": int(count),
                 "total_seconds": float(total),
                 "mean_ms": float(total * 1000.0 / count) if count else 0.0,
+                "last_ms": float(self._last_values.get(name, 0.0) * 1000.0),
                 "max_ms": float(self._maxima[name] * 1000.0),
             }
         return result
@@ -188,21 +199,29 @@ class RuntimeProfiler:
             item = data.get(name)
             return f"{item['mean_ms']:.2f}ms" if item else "n/a"
 
-        def mean_seconds(name: str) -> str:
+        def seconds_summary(name: str) -> str:
             item = data.get(name)
-            return f"{item['total_seconds'] / item['count']:.2f}s/call" if item and item["count"] else "n/a"
+            if not item or not item["count"]:
+                return "n/a"
+            mean_seconds_value = item["total_seconds"] / item["count"]
+            last_seconds_value = item["last_ms"] / 1000.0
+            max_seconds_value = item["max_ms"] / 1000.0
+            return (
+                f"last={last_seconds_value:.2f}s | avg={mean_seconds_value:.2f}s | "
+                f"max={max_seconds_value:.2f}s | n={item['count']}"
+            )
 
         inference = (
             f"policy forward={mean_ms('policy_forward')} | "
             f"extra predict={mean_ms('policy_predict')}"
         )
         vector = f"send={mean_ms('vec_send')} | worker wait+IPC={mean_ms('vec_wait')}"
-        optimizer = mean_seconds("ppo_update")
+        optimizer = seconds_summary("ppo_update")
         io = (
             f"TensorBoard dump={mean_ms('tensorboard_dump')} | "
-            f"model save={mean_seconds('model_save')} | "
+            f"model save={seconds_summary('model_save')} | "
             f"archive={mean_ms('archive_save')} | "
-            f"savestates={mean_seconds('emulator_state_save')}"
+            f"savestates={seconds_summary('emulator_state_save')}"
         )
         return [
             ("Parent timing — inference", inference),

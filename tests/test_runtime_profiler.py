@@ -57,7 +57,8 @@ class RuntimeProfilerTests(unittest.TestCase):
         self.assertTrue(installed["policy_predict"])
         self.assertTrue(installed["vec_send"])
         self.assertTrue(installed["vec_wait"])
-        self.assertTrue(installed["ppo_update"])
+        self.assertFalse(installed["ppo_update"], "PPO train must be timed by SafeRecurrentPPO, not monkeypatched")
+        self.assertNotIn("train", vars(model), "profiler must not attach a serializable closure to the model")
         self.assertTrue(installed["tensorboard_dump"])
         self.assertTrue(installed["model_save"])
         self.assertTrue(installed["archive_save"])
@@ -67,6 +68,7 @@ class RuntimeProfilerTests(unittest.TestCase):
         self.assertEqual(env.step_async([1, 2]), "sent")
         self.assertEqual(env.step_wait(), "received")
         self.assertEqual(model.train(), "trained")
+        profiler.record("ppo_update", 0.012)
         self.assertEqual(model.logger.dump(123), 123)
         self.assertEqual(namespace["atomic_save_model"](model), "model.zip")
         self.assertEqual(namespace["archive_model_checkpoint"]("model.zip", 1), "archive.zip")
@@ -80,6 +82,10 @@ class RuntimeProfilerTests(unittest.TestCase):
         ):
             self.assertEqual(snapshot[key]["count"], 1, key)
             self.assertGreaterEqual(snapshot[key]["total_seconds"], 0.0, key)
+        self.assertAlmostEqual(snapshot["ppo_update"]["last_ms"], 12.0, places=3)
+        self.assertAlmostEqual(snapshot["ppo_update"]["max_ms"], 12.0, places=3)
+        self.assertIn("last=0.01s", profiler.format_rows()[2][1])
+        self.assertIn("n=1", profiler.format_rows()[2][1])
 
         self.assertEqual(len(profiler.format_rows()), 4)
 
@@ -93,6 +99,8 @@ class RuntimeProfilerTests(unittest.TestCase):
         namespace = {"atomic_save_model": lambda: "original"}
         original_save = namespace["atomic_save_model"]
         profiler.instrument_training(model, env, namespace)
+        self.assertIs(model.train.__func__, original_train.__func__)
+        self.assertIs(model.train.__self__, original_train.__self__)
         profiler.restore()
 
         self.assertIs(model.policy.forward.__func__, original_forward.__func__)

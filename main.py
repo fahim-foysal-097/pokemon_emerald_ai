@@ -5374,6 +5374,7 @@ class StopAndCheckpointCallback(BaseCallback):
 
     def _save_after_optimizer_update(self):
         """Publish due/interrupt checkpoints only after RecurrentPPO.train() returns."""
+        global SAFE_STOP_AFTER_UPDATE
         if not self._checkpoint_due and not STOP_REQUESTED:
             return False
 
@@ -5382,13 +5383,24 @@ class StopAndCheckpointCallback(BaseCallback):
         try:
             saved_model = atomic_save_model(self.model, MODEL_CHECKPOINT)
         except Exception as exc:
-            # Keep the request latched. SafeRecurrentPPO will continue with another
-            # complete rollout/update and retry at the next safe boundary.
             print(
                 f"[Checkpoint Error] Could not save the {reason} model checkpoint at "
                 f"{checkpoint_timestep:,}: {type(exc).__name__}: {exc}",
                 flush=True,
             )
+            if STOP_REQUESTED:
+                # Do not enter another rollout indefinitely. SafeRecurrentPPO has
+                # reached a completed optimizer-update boundary; stop here, restore
+                # diagnostic hooks in learn()'s finally block, then retry the save.
+                # The previous atomic checkpoint remains untouched if this also fails.
+                SAFE_STOP_AFTER_UPDATE = True
+                print(
+                    "[Interrupt Warning] The immediate checkpoint attempt failed. "
+                    "Stopping at this completed PPO update and retrying after profiler "
+                    "hooks are removed; the previous verified checkpoint is preserved.",
+                    flush=True,
+                )
+                return True
             return False
 
         self._last_save_timestep = checkpoint_timestep
@@ -5434,16 +5446,21 @@ class StopAndCheckpointCallback(BaseCallback):
             ACTIVE_TRAINING_CALLBACK = None
 
 class SafeRecurrentPPO(RecurrentPPO):
-    """RecurrentPPO that only honors stop requests after a complete update is saved.
+    """Honor stop requests only after a complete optimizer update boundary.
 
     SB3 normally exits its learn loop if a callback returns False during rollout
     collection. That behavior discards the partial rollout before PPO.train(). This
     subclass keeps collection running to the rollout boundary, completes the optimizer
-    update, then asks the next collect_rollouts() call to stop.
+    update, attempts an atomic checkpoint, and then asks the next collect_rollouts() call
+    to stop. If that first save attempt fails during an interrupt, the final save is
+    retried after diagnostic wrappers have been restored.
     """
 
     def train(self):
         global LAST_COMPLETED_UPDATE_TIMESTEP, PPO_UPDATE_FAILED, SAFE_STOP_AFTER_UPDATE
+        callback = ACTIVE_TRAINING_CALLBACK
+        profiler = getattr(callback, "runtime_profiler", None) if callback is not None else None
+        update_started = time.perf_counter()
         try:
             result = super().train()
         except BaseException:
@@ -5451,10 +5468,15 @@ class SafeRecurrentPPO(RecurrentPPO):
             # epochs in memory. Do not publish that ambiguous state from main()'s finally.
             PPO_UPDATE_FAILED = True
             raise
+        finally:
+            # Explicit instrumentation avoids putting a closure on model.train, which
+            # SB3/cloudpickle would otherwise serialize together with multiprocessing
+            # objects retained by the profiler.
+            if profiler is not None:
+                profiler.record("ppo_update", time.perf_counter() - update_started)
 
         # This marker advances only after all configured PPO epochs complete successfully.
         LAST_COMPLETED_UPDATE_TIMESTEP = int(self.num_timesteps)
-        callback = ACTIVE_TRAINING_CALLBACK
         if callback is not None:
             stop_after_save = callback._save_after_optimizer_update()
             if stop_after_save:
@@ -5775,13 +5797,24 @@ if __name__ == "__main__":
                     flush=True,
                 )
 
+            print(
+                "[Loaded PPO Configuration] "
+                f"n_steps={getattr(model, 'n_steps', 'n/a')} | "
+                f"batch_size={getattr(model, 'batch_size', 'n/a')} | "
+                f"n_epochs={getattr(model, 'n_epochs', 'n/a')} | "
+                f"n_envs={getattr(model, 'n_envs', 'n/a')} | "
+                f"num_timesteps={getattr(model, 'num_timesteps', 'n/a')}",
+                flush=True,
+            )
+
             runtime_profiler = RuntimeProfiler(enabled=TIMING_DIAGNOSTICS)
             if TIMING_DIAGNOSTICS:
                 installed = runtime_profiler.instrument_training(model, env, globals())
                 installed_names = ", ".join(name for name, active in installed.items() if active)
                 print(
-                    f"[Performance] Parent-process timing enabled; probes={installed_names or 'none'}. "
-                    "Timings are cumulative averages and include worker wait/IPC separately from worker step time.",
+                    f"[Performance] Parent-process timing enabled; probes={installed_names or 'none'}; "
+                    "PPO update duration uses a non-invasive SafeRecurrentPPO hook. "
+                    "Timings include worker wait/IPC separately from worker step time.",
                     flush=True,
                 )
 
@@ -5795,6 +5828,20 @@ if __name__ == "__main__":
                 # Retained as a fallback; the signal handler normally sets STOP_REQUESTED instead.
                 print("[Interrupt] KeyboardInterrupt received during training.")
             finally:
+                if runtime_profiler is not None and runtime_profiler.enabled:
+                    final_profile_rows = runtime_profiler.format_rows()
+                    if final_profile_rows:
+                        print(
+                            "\n" + _format_progress_table(
+                                "FINAL PARENT-PROCESS PERFORMANCE PROFILE", final_profile_rows, width=None
+                            ),
+                            flush=True,
+                        )
+                    # The profiler must not retain instance-level wrappers while SB3
+                    # serializes the final model. This also makes the final save a clean
+                    # retry if the callback's interrupt save attempt failed.
+                    runtime_profiler.restore()
+
                 observed_timestep = int(getattr(model, "num_timesteps", 0))
                 completed_timestep = LAST_COMPLETED_UPDATE_TIMESTEP
 
@@ -6383,10 +6430,7 @@ if __name__ == "__main__":
                 )
             else:
                 _save_vector_env_state(env, timestep=current_timestep)
-            if runtime_profiler is not None and TIMING_DIAGNOSTICS:
-                final_profile_rows = runtime_profiler.format_rows()
-                if final_profile_rows:
-                    print("\n" + _format_progress_table("FINAL PARENT-PROCESS PERFORMANCE PROFILE", final_profile_rows, width=None), flush=True)
+            if runtime_profiler is not None and runtime_profiler.is_installed:
                 runtime_profiler.restore()
             try:
                 env.close()

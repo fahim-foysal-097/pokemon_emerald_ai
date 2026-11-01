@@ -46,6 +46,7 @@ class MainSourceGuardTests(unittest.TestCase):
 
         safe_train = _method_source(self.tree, "SafeRecurrentPPO", "train")
         self.assertLess(safe_train.index("super().train()"), safe_train.index("_save_after_optimizer_update"))
+        self.assertIn('profiler.record("ppo_update"', safe_train)
         collect = _method_source(self.tree, "SafeRecurrentPPO", "collect_rollouts")
         self.assertIn("SAFE_STOP_AFTER_UPDATE", collect)
 
@@ -68,6 +69,18 @@ class MainSourceGuardTests(unittest.TestCase):
         self.assertIn("VECTOR_ROLLOUT_TRANSITIONS = NUM_CPU * PPO_N_STEPS", self.source)
         self.assertIn("CHECKPOINT_SAVE_FREQUENCY = (", self.source)
         self.assertIn("_save_after_optimizer_update", self.source)
+
+    def test_failed_interrupt_save_stops_after_update_for_final_retry(self):
+        callback_save = _method_source(self.tree, "StopAndCheckpointCallback", "_save_after_optimizer_update")
+        self.assertIn("if STOP_REQUESTED:", callback_save)
+        self.assertIn("SAFE_STOP_AFTER_UPDATE = True", callback_save)
+        self.assertIn("Stopping at this completed PPO update", callback_save)
+        learn_finally = self.source.index(
+            "finally:\n                if runtime_profiler is not None and runtime_profiler.enabled:"
+        )
+        final_save = self.source.index("saved_model = atomic_save_model(model, MODEL_CHECKPOINT)", learn_finally)
+        profiler_restore = self.source.index("runtime_profiler.restore()", learn_finally)
+        self.assertLess(profiler_restore, final_save)
 
     def test_final_save_uses_only_a_completed_optimizer_update(self):
         safe_train = _method_source(self.tree, "SafeRecurrentPPO", "train")
