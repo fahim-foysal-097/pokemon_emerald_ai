@@ -24,7 +24,7 @@ from collections import Counter, deque
 
 from important_logging import filter_persistent_log_text, should_flush_important_log, is_exception_end
 from curriculum_objectives import (
-    OBJECTIVE_DEFINITIONS, STAGES,
+    OBJECTIVE_DEFINITIONS, OBJECTIVES_REQUIRING_FLAG_TELEMETRY, STAGES,
     ROUTE_101_MAP_ID, objective_satisfied as _objective_satisfied,
     objective_start_error, resolve_runtime_start_state_path,
 )
@@ -855,9 +855,17 @@ FRAME_DIAGNOSTICS = os.environ.get("POKEMON_AI_FRAME_DIAGNOSTICS", "0").strip().
 SETUP_DIAGNOSTICS_EVERY = int(os.environ.get("POKEMON_AI_SETUP_DIAGNOSTICS_EVERY", "300"))
 if SETUP_DIAGNOSTICS_EVERY < 1:
     raise ValueError("POKEMON_AI_SETUP_DIAGNOSTICS_EVERY must be a positive integer")
-MAX_EPISODE_STEPS = int(os.environ.get("POKEMON_AI_MAX_EPISODE_STEPS", "30000"))
-if MAX_EPISODE_STEPS < 1:
+_configured_max_episode_steps = int(os.environ.get("POKEMON_AI_MAX_EPISODE_STEPS", "30000"))
+if _configured_max_episode_steps < 1:
     raise ValueError("POKEMON_AI_MAX_EPISODE_STEPS must be a positive integer")
+# Curriculum evaluation uses a shorter objective-specific cap supplied by
+# run_curriculum.py. Training retains the configured episode horizon unchanged.
+_eval_max_episode_steps = int(os.environ.get(
+    "POKEMON_AI_EVAL_MAX_EPISODE_STEPS", str(_configured_max_episode_steps)
+)) if MODE == "evaluate" else _configured_max_episode_steps
+if _eval_max_episode_steps < 1:
+    raise ValueError("POKEMON_AI_EVAL_MAX_EPISODE_STEPS must be a positive integer")
+MAX_EPISODE_STEPS = _eval_max_episode_steps
 # Soft exploration mini-episodes periodically clear only short-term exploration memory
 # during longer objectives. The game state, PPO episode, reward totals and LSTM state stay live.
 # Starter training remains unchanged; zero disables mini-episodes for all objectives.
@@ -875,6 +883,11 @@ if EVAL_DIAGNOSTICS_EVERY < 1:
 EVAL_STAGNATION_STEPS = int(os.environ.get("POKEMON_AI_EVAL_STAGNATION_STEPS", "128"))
 if EVAL_STAGNATION_STEPS < 16:
     raise ValueError("POKEMON_AI_EVAL_STAGNATION_STEPS must be >= 16")
+# Unlike the exact-repeat guard above, this counter detects loops where the
+# policy varies its buttons but makes no measurable progress in the game.
+EVAL_NO_PROGRESS_STEPS = int(os.environ.get("POKEMON_AI_EVAL_NO_PROGRESS_STEPS", "4096"))
+if EVAL_NO_PROGRESS_STEPS < 128:
+    raise ValueError("POKEMON_AI_EVAL_NO_PROGRESS_STEPS must be >= 128")
 # General, non-directional shaping. Existing milestone and progression rewards remain;
 # novelty rewards decay across episodes so revisiting familiar places is less profitable.
 STEP_PENALTY = float(os.environ.get("POKEMON_AI_STEP_PENALTY", "0.00005"))
@@ -969,6 +982,9 @@ for _town_flag in range(0x86F, 0x87F):
     STORY_FLAG_REWARDS.setdefault(_town_flag, 0.75)
 
 OBS_STORY_FLAG_IDS = tuple(sorted(STORY_FLAG_REWARDS))
+# FLAG_BADGE01_GET through FLAG_BADGE08_GET are 0x867..0x86E in standard Emerald.
+BADGE_FLAG_IDS = tuple(range(0x867, 0x86F))
+FLAG_BYTE_OFFSETS = tuple(sorted({flag_id >> 3 for flag_id in set(OBS_STORY_FLAG_IDS) | set(BADGE_FLAG_IDS)}))
 PREVIOUS_ACTION_FEATURE_NAMES = (
     "previous_action_wait", "previous_action_up", "previous_action_down",
     "previous_action_left", "previous_action_right", "previous_action_a",
@@ -1187,6 +1203,9 @@ def _training_start_validation_error(state, objective=None):
     if objective not in OBJECTIVE_DEFINITIONS:
         return "unknown objective; choose one of: " + ", ".join(OBJECTIVE_DEFINITIONS)
 
+    if state.get("saveblock_pointer_stable", True) is False:
+        return "SaveBlock1 pointer changed during the state read; map/position telemetry is not trustworthy"
+
     coordinates = (_finite_number(state.get("player_x")), _finite_number(state.get("player_y")))
     if any(value is None or not value.is_integer() or value < 0 or value > 255 for value in coordinates):
         return "player coordinates are invalid; save while the character is in normal gameplay"
@@ -1198,7 +1217,6 @@ def _training_start_validation_error(state, objective=None):
     story_flags = state.get("story_flags")
     if not isinstance(story_flags, (set, frozenset, list, tuple, range)):
         return "story flags are missing or invalid; verify the SaveBlock1 pointer and RAM mapping"
-
     party_count = _finite_number(state.get("party_count"))
     party_levels = _finite_number(state.get("party_levels"))
     if (
@@ -1396,9 +1414,6 @@ GEN3_SUBSTRUCT_ORDERS = (
     "EGAM", "EGMA", "EAGM", "EAMG", "EMGA", "EMAG",
     "MGAE", "MGEA", "MAGE", "MAEG", "MEGA", "MEAG",
 )
-# FLAG_BADGE01_GET through FLAG_BADGE08_GET are 0x867..0x86E in standard Emerald.
-BADGE_FLAG_IDS = tuple(range(0x867, 0x86F))
-
 # This is the GBA key index order used by mGBA's documented GBA_KEY constants.
 # setKeys() expects a bitmask, so each key index is converted to 1 << index.
 GBA_KEY_INDEX = {
@@ -1495,6 +1510,72 @@ def _screen_observation_signature(observation):
         return hashlib.blake2s(quantized.tobytes(), digest_size=8).hexdigest()
     except Exception:
         return None
+
+
+def _evaluation_progress_signature(info):
+    """Return monotonic gameplay telemetry, excluding coordinates/action identity.
+
+    An agent can move around an already explored room or alternate buttons forever.
+    Coordinates and action identity therefore do not count as objective progress.
+    New tiles/maps, changed story flags, trainer flags, party growth, or badges do.
+    """
+    if not isinstance(info, dict) or bool(info.get("ram_read_failed", False)):
+        return None
+
+    def scalar_int(key, default=-1):
+        value = info.get(key, default)
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return number
+
+    raw_flags = info.get("story_flags", ())
+    if isinstance(raw_flags, (set, frozenset, list, tuple)):
+        try:
+            story_flags = tuple(sorted(int(flag) for flag in raw_flags))
+        except (TypeError, ValueError, OverflowError):
+            story_flags = ()
+    else:
+        story_flags = ()
+
+    return (
+        # map_id itself is deliberately excluded: toggling between two already
+        # visited maps must not keep an otherwise stagnant evaluation alive.
+        # First-time maps are represented by the cumulative unique_maps value.
+        scalar_int("party_count"),
+        scalar_int("party_levels"),
+        scalar_int("badge_count"),
+        bool(info.get("starter_flag", False)),
+        bool(info.get("pokedex_flag", False)),
+        story_flags,
+        scalar_int("trainer_flag_count"),
+        scalar_int("unique_tiles_episode"),
+        scalar_int("unique_maps_episode"),
+        scalar_int("story_flags_episode"),
+        scalar_int("trainer_flags_episode"),
+    )
+
+
+def _evaluation_has_explicit_progress(info):
+    """Detect cumulative progression events not yet reflected in the telemetry snapshot.
+
+    Do not use ``new_tile_discovered`` or ``new_area_discovered`` here: the
+    environment intentionally clears its *mini-episode* novelty sets every few
+    thousand steps. Revisiting an old tile after that reset is reward novelty,
+    not new game progress. First-time tiles/maps are already counted by the
+    cumulative ``unique_tiles_episode``/``unique_maps_episode`` fields in the
+    progress signature.
+    """
+    if not isinstance(info, dict) or bool(info.get("ram_read_failed", False)):
+        return False
+    for key in ("new_story_flags", "new_trainer_flags", "new_badges_this_step", "party_experience_delta"):
+        try:
+            if float(info.get(key, 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return False
 
 
 # mGBA Python bindings expose raw core snapshots, not the frontend saveStateFile API.
@@ -2022,6 +2103,18 @@ class EmeraldEnv(gym.Env):
         self._last_party_debug_signature = None
         self._pending_reset_elapsed_ms = 0.0
         self._cached_trainer_flags = set()
+        self._cached_trainer_flags_valid = False
+        self._story_flag_baseline_verified = False
+        self._trainer_flag_baseline_verified = False
+        self._badge_baseline_verified = False
+        self._last_verified_story_flags = None
+        self._last_verified_badge_flags = None
+        self._last_verified_flag_bytes = None
+        self._last_verified_trainer_flags = None
+        self._last_flag_diag_signature = None
+        self.flag_telemetry_invalid_steps = 0
+        self.trainer_flag_telemetry_invalid_steps = 0
+        self.seen_badge_flags = 0
         self._training_success_logged_once = False
         self._terminal_episode_count = 0
         # Full Gymnasium-episode metrics remain cumulative until true termination.
@@ -2868,27 +2961,44 @@ class EmeraldEnv(gym.Env):
             return None, None
         return x, y
 
-    def _read_story_flags(self, saveblock1_ptr):
-        """Read curated persistent story flags from SaveBlock1.flags."""
+    def _read_flag_byte_snapshot(self, saveblock1_ptr):
+        """Read every byte containing a curated story or badge flag exactly once."""
+        if saveblock1_ptr is None:
+            raise ValueError("Cannot read SaveBlock1 flags without a valid pointer")
+        flags_base = saveblock1_ptr + SAVE_BLOCK1_FLAGS_OFFSET
+        return {
+            int(byte_offset): self._read8(flags_base + int(byte_offset))
+            for byte_offset in FLAG_BYTE_OFFSETS
+        }
+
+    @staticmethod
+    def _decode_flag_set(flag_ids, byte_snapshot):
+        """Decode event-flag IDs from one internally consistent byte snapshot."""
+        found = set()
+        for flag_id in flag_ids:
+            byte_value = byte_snapshot.get(int(flag_id) >> 3)
+            if byte_value is not None and byte_value & (1 << (int(flag_id) & 7)):
+                found.add(int(flag_id))
+        return found
+
+    def _read_story_flags(self, saveblock1_ptr, byte_snapshot=None):
+        """Read curated persistent story flags from a supplied stable snapshot."""
         if saveblock1_ptr is None:
             return set()
-        flags = set()
-        flags_base = saveblock1_ptr + SAVE_BLOCK1_FLAGS_OFFSET
-        for flag_id in STORY_FLAG_REWARDS:
-            flag_byte = self._read8(flags_base + (flag_id >> 3))
-            if flag_byte & (1 << (flag_id & 7)):
-                flags.add(flag_id)
-        return flags
+        if byte_snapshot is None:
+            byte_snapshot = self._read_flag_byte_snapshot(saveblock1_ptr)
+        return self._decode_flag_set(STORY_FLAG_REWARDS, byte_snapshot)
 
-    def _read_badge_flags(self, saveblock1_ptr):
-        """Return an 8-bit mask from Emerald's official badge flags (0x867..0x86E)."""
+    def _read_badge_flags(self, saveblock1_ptr, byte_snapshot=None):
+        """Return the 8-bit badge mask from the official system-flag bytes."""
         if saveblock1_ptr is None:
             return 0
-        flags_base = saveblock1_ptr + SAVE_BLOCK1_FLAGS_OFFSET
+        if byte_snapshot is None:
+            byte_snapshot = self._read_flag_byte_snapshot(saveblock1_ptr)
         mask = 0
         for badge_index, flag_id in enumerate(BADGE_FLAG_IDS):
-            flag_byte = self._read8(flags_base + (flag_id >> 3))
-            if flag_byte & (1 << (flag_id & 7)):
+            byte_value = byte_snapshot.get(flag_id >> 3, 0)
+            if byte_value & (1 << (flag_id & 7)):
                 mask |= 1 << badge_index
         return mask
 
@@ -2939,7 +3049,7 @@ class EmeraldEnv(gym.Env):
             return None
 
     def _party_debug_signature_changed(self, signature):
-        """Return True only when a live-vs-SaveBlock mismatch changes."""
+        """Return True only when the observed live-vs-save party mismatch changes."""
         previous = getattr(self, "_last_party_debug_signature", None)
         if signature == previous:
             return False
@@ -2947,14 +3057,23 @@ class EmeraldEnv(gym.Env):
         return True
 
     def _read_game_state(self, include_trainer_flags=True):
-        """Read party, badges, map, coordinates and story flags for Emerald BPEE."""
+        """Read BPEE state and accept persistent flags only from a stable RAM snapshot.
+
+        SaveBlock1 is dynamically relocated. We read its pointer before and after the
+        relevant flag bytes, and read the flag bytes twice. A changing pointer or byte
+        snapshot is not trusted. The most recent verified snapshot is retained for the
+        current emulator episode rather than converting transient reads into rewards.
+        """
         saveblock1_ptr = self._read_saveblock1_pointer()
         if saveblock1_ptr is None:
             raise ValueError("SaveBlock1 pointer is not initialized/valid yet")
 
+        # Capture the curated story/badge flag bytes before reading the rest of the state.
+        flag_bytes_first = self._read_flag_byte_snapshot(saveblock1_ptr)
+
         # Read both versions for diagnostics, but trust the live globals for gameplay.
-        # SavePlayerParty() copies the globals into SaveBlock1 on save; the SaveBlock1
-        # party fields are not guaranteed to change immediately when the starter is given.
+        # SavePlayerParty() copies the globals into SaveBlock1 on save; its party fields
+        # are not guaranteed to change immediately when the starter is given.
         saveblock_party_count = self._read8(saveblock1_ptr + SAVE_BLOCK1_PARTY_COUNT_OFFSET)
         party_count = self._read8(PLAYER_PARTY_COUNT_ADDRESS)
         if party_count > 6:
@@ -2973,29 +3092,127 @@ class EmeraldEnv(gym.Env):
             if 1 <= level <= 100:
                 total_party_levels += level
 
-        badge_flags = self._read_badge_flags(saveblock1_ptr)
-        # SaveBlock1.location is a WarpData at offset 0x04; mapGroup/mapNum are signed bytes.
+        # SaveBlock1.location is WarpData at offset 0x04; its map group/number
+        # fields are signed bytes in the decompilation.
         map_group = self._read8(saveblock1_ptr + SAVE_BLOCK1_LOCATION_OFFSET)
         map_number = self._read8(saveblock1_ptr + SAVE_BLOCK1_LOCATION_OFFSET + 1)
         if map_group >= 0x80:
             map_group -= 0x100
         if map_number >= 0x80:
             map_number -= 0x100
-        # Map group/number are signed bytes in WarpData. Keep the full nonnegative
-        # signed-byte range rather than hardcoding an assumed number of map groups.
         if 0 <= map_group <= 127 and 0 <= map_number <= 127:
             map_id = (map_group << 8) | map_number
         else:
             map_id = -1
         player_x, player_y = self._read_player_position(saveblock1_ptr)
-        story_flags = self._read_story_flags(saveblock1_ptr)
-        if include_trainer_flags or not hasattr(self, "_cached_trainer_flags"):
-            trainer_flags = self._read_trainer_flags(saveblock1_ptr)
-            self._cached_trainer_flags = set(trainer_flags)
+
+        badge_flags_raw = self._read_badge_flags(saveblock1_ptr, flag_bytes_first)
+        story_flags_raw = self._read_story_flags(saveblock1_ptr, flag_bytes_first)
+
+        # Trainer flags are scanned twice on polling steps. This is a small bounded
+        # cost (108 bytes per scan, normally once every eight policy decisions) and
+        # prevents a torn read from being counted as hundreds of trainer victories.
+        trainer_scan_performed = bool(include_trainer_flags or not hasattr(self, "_cached_trainer_flags"))
+        trainer_flags_first = set()
+        trainer_scan_stable = bool(getattr(self, "_cached_trainer_flags_valid", False))
+        if trainer_scan_performed:
+            trainer_flags_first = self._read_trainer_flags(saveblock1_ptr)
+            trainer_flags_second = self._read_trainer_flags(saveblock1_ptr)
+            trainer_scan_stable = trainer_flags_first == trainer_flags_second
+
+        # Re-read the same curated bytes and pointer after all related reads. A
+        # snapshot is valid only if the source remained identical throughout.
+        flag_bytes_second = self._read_flag_byte_snapshot(saveblock1_ptr)
+        pointer_after = self._read_saveblock1_pointer()
+        saveblock_pointer_stable = pointer_after == saveblock1_ptr
+        flag_bytes_stable = flag_bytes_first == flag_bytes_second
+        flag_snapshot_valid = bool(saveblock_pointer_stable and flag_bytes_stable)
+        trainer_snapshot_valid = bool(flag_snapshot_valid and trainer_scan_stable)
+
+        # Preserve the raw decoded location for diagnostics, but expose it to the
+        # policy/objective/reward code only when the SaveBlock1 pointer stayed fixed.
+        raw_map_id = int(map_id)
+        raw_player_x = player_x
+        raw_player_y = player_y
+        if not saveblock_pointer_stable:
+            map_id = -1
+            player_x = None
+            player_y = None
+
+        raw_flag_bytes = {
+            f"0x{offset:03X}": int(value)
+            for offset, value in flag_bytes_first.items()
+        }
+        # Curated Emerald event flags, badge flags and trainer-defeated flags are
+        # persistent for this task. Keep verified values monotonic within an episode.
+        previous_story_flags = set(getattr(self, "_last_verified_story_flags", None) or ())
+        previous_badge_flags = int(getattr(self, "_last_verified_badge_flags", None) or 0)
+        previous_trainer_flags = set(getattr(self, "_last_verified_trainer_flags", None) or ())
+        # A regression is diagnostic only when both samples were verified. An
+        # unstable/torn snapshot must not be presented as proof that a persistent
+        # story, badge, or trainer flag actually disappeared.
+        story_flag_regressions = (
+            sorted(previous_story_flags - set(story_flags_raw))
+            if flag_snapshot_valid else []
+        )
+        badge_flag_regressions = (
+            previous_badge_flags & ~int(badge_flags_raw)
+            if flag_snapshot_valid else 0
+        )
+        trainer_flag_regressions = (
+            sorted(previous_trainer_flags - set(trainer_flags_first))
+            if trainer_snapshot_valid else []
+        )
+        if flag_snapshot_valid:
+            verified_story_flags = previous_story_flags | set(story_flags_raw)
+            verified_badge_flags = previous_badge_flags | int(badge_flags_raw)
+            self._last_verified_story_flags = set(verified_story_flags)
+            self._last_verified_badge_flags = int(verified_badge_flags)
+            self._last_verified_flag_bytes = dict(flag_bytes_first)
         else:
-            # Read-only consumers use this set without mutation; reusing it avoids a
-            # new Python set allocation on every non-polling action.
-            trainer_flags = self._cached_trainer_flags
+            verified_story_flags = previous_story_flags
+            verified_badge_flags = previous_badge_flags
+
+        if trainer_snapshot_valid:
+            verified_trainer_flags = previous_trainer_flags | set(trainer_flags_first)
+            self._cached_trainer_flags = set(verified_trainer_flags)
+            self._cached_trainer_flags_valid = True
+            self._last_verified_trainer_flags = set(verified_trainer_flags)
+        last_verified_trainer_flags = getattr(self, "_last_verified_trainer_flags", None)
+        cached_trainer_flags = getattr(self, "_cached_trainer_flags", set())
+        trainer_flags = set(
+            last_verified_trainer_flags
+            if last_verified_trainer_flags is not None
+            else cached_trainer_flags
+        )
+
+        # In vanilla Emerald, FLAG_SYS_POKEMON_GET should be persistent. However,
+        # the live party is the stronger gameplay fact: once a Pokémon is in the
+        # validated live party, expose starter_obtained as true even if the raw
+        # SaveBlock1 event bit is temporarily unreadable or inconsistent.
+        effective_story_flags = set(verified_story_flags)
+        if party_count >= 1 and total_party_levels >= 1:
+            effective_story_flags.add(STARTER_OBTAINED_FLAG_ID)
+        starter_flag_raw = (
+            STARTER_OBTAINED_FLAG_ID in story_flags_raw if flag_snapshot_valid else None
+        )
+
+        if not flag_snapshot_valid:
+            flag_error = (
+                "SaveBlock1 pointer changed during the flag read"
+                if not saveblock_pointer_stable
+                else "curated SaveBlock1 flag bytes changed during the double-read"
+            )
+        else:
+            flag_error = None
+        if trainer_snapshot_valid:
+            trainer_error = None
+        elif not flag_snapshot_valid:
+            trainer_error = flag_error
+        else:
+            trainer_error = "trainer flag range changed during the double-read"
+
+        badge_flags = int(verified_badge_flags)
         return {
             "party_count": party_count,
             "party_levels": total_party_levels,
@@ -3004,13 +3221,31 @@ class EmeraldEnv(gym.Env):
             "party_count_source": "live_gPlayerPartyCount",
             "badge_flags": badge_flags,
             "badge_count": badge_flags.bit_count(),
+            "raw_badge_flags": int(badge_flags_raw),
             "map_id": map_id,
+            "raw_map_id": raw_map_id,
             "map_group": map_group,
             "map_number": map_number,
             "player_x": player_x,
             "player_y": player_y,
-            "story_flags": story_flags,
+            "raw_player_x": raw_player_x,
+            "raw_player_y": raw_player_y,
+            "story_flags": effective_story_flags,
+            "raw_story_flags": set(story_flags_raw),
             "trainer_flags": trainer_flags,
+            "raw_trainer_flag_count": len(trainer_flags_first) if trainer_scan_performed else len(trainer_flags),
+            "starter_flag_raw": starter_flag_raw,
+            "starter_obtained": bool(STARTER_OBTAINED_FLAG_ID in effective_story_flags),
+            "flag_telemetry_valid": bool(flag_snapshot_valid),
+            "trainer_flag_telemetry_valid": bool(trainer_snapshot_valid),
+            "saveblock_pointer_stable": bool(saveblock_pointer_stable),
+            "flag_telemetry_error": flag_error,
+            "trainer_flag_telemetry_error": trainer_error,
+            "story_flag_regressions": story_flag_regressions,
+            "badge_flag_regressions": int(badge_flag_regressions),
+            "trainer_flag_regressions": trainer_flag_regressions,
+            "saveblock1_ptr": int(saveblock1_ptr),
+            "raw_flag_bytes": raw_flag_bytes,
         }
 
     def _refresh_reward_baseline(self):
@@ -3019,16 +3254,32 @@ class EmeraldEnv(gym.Env):
             self.prev_party_levels = state["party_levels"]
             self.prev_party_experience = self._read_party_experience(state["party_count"])
             self.prev_badges = state["badge_flags"]
+            if state.get("flag_telemetry_valid", False):
+                self.seen_badge_flags = int(state["badge_flags"]) & 0xFF
+                self._badge_baseline_verified = True
+                self.seen_story_flags.update(state.get("story_flags", set()))
+                self._story_flag_baseline_verified = True
+            else:
+                self._badge_baseline_verified = False
+                self._story_flag_baseline_verified = False
+            if state.get("trainer_flag_telemetry_valid", False):
+                self.seen_trainer_flags.update(state.get("trainer_flags", set()))
+                self._trainer_flag_baseline_verified = True
+            else:
+                self._trainer_flag_baseline_verified = False
             self.prev_caught_count = state["party_count"]
             self.prev_map_id = state["map_id"]
-            if state["map_id"] >= 0:
+            if state.get("saveblock_pointer_stable", False) and state["map_id"] >= 0:
                 map_id = int(state["map_id"])
                 self.visited_maps.add(map_id)
                 self.mini_visited_maps.add(map_id)
                 self.lifetime_map_visits[map_id] += 1
-            self.seen_story_flags.update(state.get("story_flags", set()))
-            self.seen_trainer_flags.update(state.get("trainer_flags", set()))
-            if state["map_id"] >= 0 and state.get("player_x") is not None and state.get("player_y") is not None:
+            if (
+                state.get("saveblock_pointer_stable", False)
+                and state["map_id"] >= 0
+                and state.get("player_x") is not None
+                and state.get("player_y") is not None
+            ):
                 position = (int(state["map_id"]), int(state["player_x"]), int(state["player_y"]))
                 self.visited_tiles.add(position)
                 self.mini_visited_tiles.add(position)
@@ -3070,6 +3321,18 @@ class EmeraldEnv(gym.Env):
             self.seen_screen_signatures.clear()
             self.seen_story_flags.clear()
             self.seen_trainer_flags.clear()
+            self.seen_badge_flags = 0
+            self._last_verified_story_flags = None
+            self._last_verified_badge_flags = None
+            self._last_verified_flag_bytes = None
+            self._last_verified_trainer_flags = None
+            self._cached_trainer_flags = set()
+            self._cached_trainer_flags_valid = False
+            self._story_flag_baseline_verified = False
+            self._trainer_flag_baseline_verified = False
+            self._badge_baseline_verified = False
+            self.flag_telemetry_invalid_steps = 0
+            self.trainer_flag_telemetry_invalid_steps = 0
             self.position_history.clear()
             self.screen_signature_history.clear()
             self.mini_episode_count = 0
@@ -3338,7 +3601,38 @@ class EmeraldEnv(gym.Env):
                 # as the live party source. Emit only when the observed mismatch changes.
                 live_party_count = int(state["party_count"])
                 saved_party_count = int(state["party_count_saveblock1"])
-                starter_flag_set = STARTER_OBTAINED_FLAG_ID in state.get("story_flags", set())
+                starter_flag_raw = state.get("starter_flag_raw")
+                starter_flag_set = bool(
+                    state.get("starter_obtained", False)
+                    or (live_party_count >= 1 and int(state.get("party_levels", 0)) >= 1)
+                )
+                if not state.get("flag_telemetry_valid", False):
+                    self.flag_telemetry_invalid_steps += 1
+                if not state.get("trainer_flag_telemetry_valid", False):
+                    self.trainer_flag_telemetry_invalid_steps += 1
+
+                # Print the raw system-flag bytes when they change. This tells us
+                # whether a false starter bit comes from an actual byte change or
+                # from an unstable pointer/byte sample, without flooding every step.
+                raw_bytes = state.get("raw_flag_bytes", {})
+                flag_diag_signature = (
+                    state.get("saveblock1_ptr"),
+                    raw_bytes.get("0x10C"),
+                    raw_bytes.get("0x10D"),
+                    bool(state.get("flag_telemetry_valid", False)),
+                )
+                if flag_diag_signature != self._last_flag_diag_signature:
+                    self._last_flag_diag_signature = flag_diag_signature
+                    print(
+                        f"[SaveBlock1 Flags] env={self.env_id} ptr=0x{int(state.get('saveblock1_ptr', 0)):08X} "
+                        f"stable={bool(state.get('flag_telemetry_valid', False))} "
+                        f"ptr_stable={bool(state.get('saveblock_pointer_stable', False))} "
+                        f"bytes[0x10C/0x10D]={raw_bytes.get('0x10C', '??')}/{raw_bytes.get('0x10D', '??')} "
+                        f"starter_raw={starter_flag_raw} starter_effective={starter_flag_set} "
+                        f"party={live_party_count} levels={state.get('party_levels', 0)} "
+                        f"error={state.get('flag_telemetry_error') or 'none'}",
+                        flush=True,
+                    )
 
                 # A small reward for actual party EXP gain encourages defeating wild Pokémon
                 # even when the EXP gain is too small to trigger a level-up. Party count must
@@ -3367,14 +3661,16 @@ class EmeraldEnv(gym.Env):
                 if live_party_count != saved_party_count:
                     party_signature = (
                         live_party_count, saved_party_count, int(state["party_levels"]),
-                        tuple(state.get("party_slot_levels", ())), starter_flag_set,
+                        tuple(state.get("party_slot_levels", ())),
                     )
                     if self._party_debug_signature_changed(party_signature):
                         party_rows = [
                             ("Authority", "live gPlayerPartyCount (SaveBlock1 is diagnostic only)"),
                             ("Party count", f"live={live_party_count} | SaveBlock1={saved_party_count}"),
                             ("Pokémon levels", f"slots={list(state.get('party_slot_levels', ()))!r} | total={state['party_levels']}"),
-                            ("Starter flag", str(starter_flag_set)),
+                            ("Starter flag (raw)", str(starter_flag_raw)),
+                            ("Starter obtained (live party)", str(starter_flag_set)),
+                            ("Flag snapshot stable", str(state.get("flag_telemetry_valid", False))),
                         ]
                         print("\n" + _format_progress_table("PARTY RAM DIAGNOSTIC — LIVE COUNT IS AUTHORITATIVE", party_rows, width=None), flush=True)
                 # Keep the last reported mismatch signature even if the mismatch clears.
@@ -3392,11 +3688,36 @@ class EmeraldEnv(gym.Env):
                     )
                 self.prev_party_levels = state["party_levels"]
 
-                new_badge_bits = state["badge_flags"] & (~self.prev_badges & 0xFF)
-                new_badges = int(new_badge_bits).bit_count()
+                observed_badge_flags = int(state.get("badge_flags", 0)) & 0xFF
+                new_badges = 0
+                if state.get("flag_telemetry_valid", False):
+                    if not self._badge_baseline_verified:
+                        # The first reliable sample after an unavailable baseline is
+                        # a baseline, not evidence that a badge was just earned.
+                        self.seen_badge_flags = observed_badge_flags
+                        self._badge_baseline_verified = True
+                    else:
+                        new_badge_bits = observed_badge_flags & (~self.seen_badge_flags & 0xFF)
+                        new_badges = int(new_badge_bits).bit_count()
+                        self.seen_badge_flags |= observed_badge_flags
                 component["badge"] = BADGE_REWARD * new_badges
-                self.prev_badges = state["badge_flags"]
+                # Latch badge bits within the episode so a later failed read cannot
+                # revoke an earned badge or award it a second time.
+                state["badge_flags"] = int(self.seen_badge_flags)
+                state["badge_count"] = int(self.seen_badge_flags).bit_count()
+                self.prev_badges = int(self.seen_badge_flags)
 
+                # Map/position fields are read through SaveBlock1. If its pointer
+                # changed during the snapshot, do not turn stale/mixed coordinates
+                # into exploration rewards or policy navigation features.
+                map_telemetry_valid = bool(state.get("saveblock_pointer_stable", False))
+                if not map_telemetry_valid:
+                    state.setdefault("raw_map_id", int(state.get("map_id", -1)))
+                    state.setdefault("raw_player_x", state.get("player_x"))
+                    state.setdefault("raw_player_y", state.get("player_y"))
+                    state["map_id"] = -1
+                    state["player_x"] = None
+                    state["player_y"] = None
                 map_id = int(state["map_id"])
                 new_area_discovered = False
                 if map_id >= 0:
@@ -3443,10 +3764,19 @@ class EmeraldEnv(gym.Env):
 
                 # Story flag bonuses are unique within an episode; reward transitions, not
                 # the absolute value of a cumulative story score.
-                current_story_flags = state.get("story_flags", set())
-                new_story_flags = current_story_flags - self.seen_story_flags
+                current_story_flags = set(state.get("story_flags", set())) | self.seen_story_flags
+                new_story_flags = set()
+                if state.get("flag_telemetry_valid", False):
+                    if not self._story_flag_baseline_verified:
+                        # Do not reward old flags discovered after a failed baseline read.
+                        self.seen_story_flags.update(current_story_flags)
+                        self._story_flag_baseline_verified = True
+                    else:
+                        new_story_flags = current_story_flags - self.seen_story_flags
+                        self.seen_story_flags.update(current_story_flags)
                 component["story"] = sum(STORY_FLAG_REWARDS.get(flag, 0.0) for flag in new_story_flags)
-                self.seen_story_flags.update(current_story_flags)
+                current_story_flags |= self.seen_story_flags
+                state["story_flags"] = current_story_flags
 
                 party_members_added = max(0, state["party_count"] - self.prev_caught_count)
                 component["party"] = PARTY_MEMBER_REWARD * party_members_added
@@ -3455,10 +3785,18 @@ class EmeraldEnv(gym.Env):
                 self.prev_caught_count = state["party_count"]
 
                 # Trainer flags are a reliable, one-time proxy for trainer victories in Emerald.
-                current_trainer_flags = state.get("trainer_flags", set())
-                new_trainer_flags = current_trainer_flags - self.seen_trainer_flags
+                current_trainer_flags = set(state.get("trainer_flags", set())) | self.seen_trainer_flags
+                new_trainer_flags = set()
+                if state.get("trainer_flag_telemetry_valid", False):
+                    if not self._trainer_flag_baseline_verified:
+                        self.seen_trainer_flags.update(current_trainer_flags)
+                        self._trainer_flag_baseline_verified = True
+                    else:
+                        new_trainer_flags = current_trainer_flags - self.seen_trainer_flags
+                        self.seen_trainer_flags.update(current_trainer_flags)
                 component["trainer"] = min(4, len(new_trainer_flags)) * TRAINER_WIN_REWARD
-                self.seen_trainer_flags.update(current_trainer_flags)
+                current_trainer_flags |= self.seen_trainer_flags
+                state["trainer_flags"] = current_trainer_flags
 
                 if new_badges:
                     self.last_notified_event = "gym_badge"
@@ -3522,7 +3860,7 @@ class EmeraldEnv(gym.Env):
                     # evaluation process. Re-saving a ~400 KB savestate on every training
                     # success adds unnecessary I/O and floods the logs, so training defers it.
                     if MODE != "train":
-                        self._save_objective_milestone(state)
+                        info["milestone_saved"] = bool(self._save_objective_milestone(state))
                     if MODE == "watch":
                         try:
                             send_notification(
@@ -3548,7 +3886,24 @@ class EmeraldEnv(gym.Env):
                     "party_count_saveblock1": state.get("party_count_saveblock1", -1),
                     "party_count_source": state.get("party_count_source", "unknown"),
                     "starter_flag": starter_flag_set,
+                    "starter_flag_raw": bool(starter_flag_raw) if starter_flag_raw is not None else None,
+                    "starter_flag_inferred_from_live_party": bool(live_party_count >= 1 and int(state.get("party_levels", 0)) >= 1),
                     "pokedex_flag": POKEDEX_OBTAINED_FLAG_ID in state.get("story_flags", set()),
+                    "flag_telemetry_valid": bool(state.get("flag_telemetry_valid", False)),
+                    "trainer_flag_telemetry_valid": bool(state.get("trainer_flag_telemetry_valid", False)),
+                    "saveblock_pointer_stable": bool(state.get("saveblock_pointer_stable", False)),
+                    "map_telemetry_valid": bool(map_telemetry_valid),
+                    "raw_map_id": int(state.get("raw_map_id", map_id)),
+                    "raw_player_x": state.get("raw_player_x", player_x),
+                    "raw_player_y": state.get("raw_player_y", player_y),
+                    "story_flag_regressions": tuple(state.get("story_flag_regressions", ())),
+                    "badge_flag_regressions": int(state.get("badge_flag_regressions", 0)),
+                    "trainer_flag_regressions": tuple(state.get("trainer_flag_regressions", ())),
+                    "raw_flag_bytes": dict(state.get("raw_flag_bytes", {})),
+                    "flag_telemetry_invalid_steps": int(self.flag_telemetry_invalid_steps),
+                    "trainer_flag_telemetry_invalid_steps": int(self.trainer_flag_telemetry_invalid_steps),
+                    "saveblock1_ptr": int(state.get("saveblock1_ptr", 0)),
+                    "raw_badge_flags": int(state.get("raw_badge_flags", 0)),
                     "story_flags": tuple(sorted(int(flag) for flag in state.get("story_flags", set()))),
                     "trainer_flag_count": len(state.get("trainer_flags", set())),
                     "new_badges": new_badges,
@@ -3948,6 +4303,23 @@ class EmeraldEnv(gym.Env):
 
     def _save_objective_milestone(self, state):
         """Save a verified objective state plus a machine-readable telemetry manifest."""
+        if state.get("saveblock_pointer_stable", True) is False:
+            print(
+                "[Milestone Warning] Objective was reached while the SaveBlock1 pointer changed; "
+                "refusing to publish an unverified milestone.",
+                flush=True,
+            )
+            return False
+        if (
+            OBJECTIVE_NAME in OBJECTIVES_REQUIRING_FLAG_TELEMETRY
+            and state.get("flag_telemetry_valid", True) is False
+        ):
+            print(
+                "[Milestone Warning] Objective depends on event/badge flags, but the SaveBlock1 "
+                "flag snapshot was unstable; refusing to publish an unverified milestone.",
+                flush=True,
+            )
+            return False
         if not MILESTONE_SAVE_ENABLED:
             print("[Milestone Save] Disabled by POKEMON_AI_MILESTONE_SAVE=0.", flush=True)
             return False
@@ -4008,6 +4380,16 @@ class EmeraldEnv(gym.Env):
                 "badge_count": int(state.get("badge_count", 0)),
                 "story_flags": sorted(int(x) for x in story_flags),
                 "trainer_flag_count": len(trainer_flags),
+                "flag_telemetry_valid": bool(state.get("flag_telemetry_valid", True)),
+                "trainer_flag_telemetry_valid": bool(state.get("trainer_flag_telemetry_valid", True)),
+                "saveblock_pointer_stable": bool(state.get("saveblock_pointer_stable", True)),
+                "starter_flag_raw": state.get("starter_flag_raw"),
+                "starter_obtained": bool(state.get("starter_obtained", False)),
+                "story_flag_regressions": [int(x) for x in state.get("story_flag_regressions", ())],
+                "badge_flag_regressions": int(state.get("badge_flag_regressions", 0)),
+                "trainer_flag_regressions": [int(x) for x in state.get("trainer_flag_regressions", ())],
+                "saveblock1_ptr": int(state.get("saveblock1_ptr", 0)),
+                "raw_flag_bytes": dict(state.get("raw_flag_bytes", {})),
             },
         }
         try:
@@ -4679,6 +5061,9 @@ class StopAndCheckpointCallback(BaseCallback):
             ("task_success", "progress/task_success_events"),
             ("ram_read_failed", "progress/ram_read_failed_envs"),
             ("starter_flag", "progress/starter_flag_workers"),
+            ("starter_flag_raw", "progress/starter_flag_raw_workers"),
+            ("flag_telemetry_valid", "progress/flag_telemetry_valid_workers"),
+            ("trainer_flag_telemetry_valid", "progress/trainer_flag_telemetry_valid_workers"),
             ("pokedex_flag", "progress/pokedex_flag_workers"),
         )
         for info_key, tb_key in event_metric_map:
@@ -4755,7 +5140,7 @@ class StopAndCheckpointCallback(BaseCallback):
         # emitted. Averaging map IDs or coordinates creates locations that do not exist.
         for info_key in (
             "map_id", "map_group", "map_number", "player_x", "player_y",
-            "party_count_saveblock1", "starter_flag", "pokedex_flag",
+            "party_count_saveblock1", "starter_flag", "starter_flag_raw", "pokedex_flag",
         ):
             tb_name = "saveblock_party_count" if info_key == "party_count_saveblock1" else info_key
             for env_index, value in _numeric_info_pairs(infos_list, info_key):
@@ -4925,7 +5310,7 @@ class StopAndCheckpointCallback(BaseCallback):
                 ("Workers", f"{worker_status} | configured environments={env_count} | action repeat={ACTION_REPEAT}+{ACTION_RELEASE_FRAMES} release frame(s)"),
                 ("Episodes", f"{episode_summary} | last episode: {last_episode_text}"),
                 ("Current party / badges", f"party count {party_summary} | total party levels max={level_summary} | badges max={badge_summary}"),
-                ("RAM health", f"party telemetry={len(party_values)}/{env_count} workers | live-vs-SaveBlock mismatches={mismatch_count if comparable_party_envs else 'n/a'}"),
+                ("RAM health", f"party telemetry={len(party_values)}/{env_count} workers | live-vs-SaveBlock mismatches={mismatch_count if comparable_party_envs else 'n/a'} | unstable flag samples={sum(int(info.get('flag_telemetry_valid') is False) for info in infos_for_state)}"),
                 ("Worker game state", worker_state_text),
                 ("Reward summary", f"last vector-step mean={self._last_step_reward:+.4f} | recent transition mean={recent_reward:+.4f} | live episode return mean={live_episode_reward_mean:+.2f} [{live_values}]"),
                 ("Reward components", f"per-environment mean for this vector step: {reward_component_text}"),
@@ -5481,7 +5866,7 @@ if __name__ == "__main__":
             print(
                 f" [MODE] {'DETERMINISTIC' if EVAL_DETERMINISTIC else 'STOCHASTIC'} EVALUATION | "
                 f"objective={OBJECTIVE_LABEL} | episodes={EVAL_EPISODES} | "
-                f"max_steps={MAX_EPISODE_STEPS} | seed={EVAL_SEED}."
+                f"max_steps={MAX_EPISODE_STEPS} | no_progress_stop={EVAL_NO_PROGRESS_STEPS} | seed={EVAL_SEED}."
             )
             print(" [MODE] Uses the mapped start state for this objective; no training updates, no GUI and no video.")
             print("--------------------------------------------------", flush=True)
@@ -5528,6 +5913,7 @@ if __name__ == "__main__":
                 episode_success = False
                 episode_outcome = "UNKNOWN"
                 episode_action_counts = Counter()
+                episode_experience_gained = 0
                 last_info = {}
                 last_action_name = "unknown"
                 last_policy_summary = None
@@ -5535,7 +5921,9 @@ if __name__ == "__main__":
                 same_action_no_progress_steps = 0
                 same_action_same_screen_steps = 0
                 previous_progress_signature = None
+                previous_state_signature = None
                 previous_screen_signature = None
+                no_progress_steps = 0
                 stagnation_reason = None
                 while not STOP_REQUESTED and episode_steps < MAX_EPISODE_STEPS:
                     if episode_steps == 0 or episode_steps % max(1, min(EVAL_DIAGNOSTICS_EVERY, 128)) == 0:
@@ -5558,33 +5946,50 @@ if __name__ == "__main__":
                     last_info = infos[0] if infos and isinstance(infos[0], dict) else {}
                     episode_return += float(np.asarray(rewards, dtype=np.float64).reshape(-1)[0])
                     episode_steps += 1
+                    try:
+                        episode_experience_gained += max(0, int(last_info.get("party_experience_delta", 0) or 0))
+                    except (TypeError, ValueError, OverflowError):
+                        pass
 
-                    story_flags_value = last_info.get("story_flags", ())
-                    if isinstance(story_flags_value, (set, frozenset, list, tuple)):
-                        story_flags_key = tuple(sorted(int(flag) for flag in story_flags_value
-                                                       if isinstance(flag, (int, np.integer))))
-                    else:
-                        story_flags_key = ()
-                    progress_signature = (
-                        last_info.get("map_id"), last_info.get("player_x"), last_info.get("player_y"),
-                        last_info.get("party_count"), last_info.get("party_levels"), last_info.get("badge_count"),
-                        last_info.get("starter_flag"), last_info.get("pokedex_flag"), story_flags_key,
-                        last_info.get("unique_tiles_episode"), last_info.get("unique_maps_episode"),
-                    )
+                    # The strict-repeat counters remain useful for diagnosing a policy
+                    # that repeats one button. The independent no-progress counter catches
+                    # alternating-action loops in an already explored area.
+                    progress_signature = _evaluation_progress_signature(last_info)
+                    # Preserve the old strict-repeat semantics: coordinate changes still
+                    # count as state changes for this fast diagnostic, while the separate
+                    # no-progress timer intentionally ignores coordinates.
+                    state_signature = (
+                        progress_signature,
+                        last_info.get("player_x"),
+                        last_info.get("player_y"),
+                    ) if progress_signature is not None else None
                     screen_signature = _screen_observation_signature(observation)
-                    if action_id == previous_action_id and progress_signature == previous_progress_signature:
+                    if (state_signature is not None and previous_state_signature is not None
+                            and action_id == previous_action_id
+                            and state_signature == previous_state_signature):
                         same_action_no_progress_steps += 1
                     else:
                         same_action_no_progress_steps = 0
-                    if (action_id == previous_action_id
-                            and progress_signature == previous_progress_signature
+                    if (state_signature is not None and previous_state_signature is not None
+                            and action_id == previous_action_id
+                            and state_signature == previous_state_signature
                             and screen_signature is not None
                             and screen_signature == previous_screen_signature):
                         same_action_same_screen_steps += 1
                     else:
                         same_action_same_screen_steps = 0
+
+                    if progress_signature is not None:
+                        if (previous_progress_signature is None
+                                or progress_signature != previous_progress_signature
+                                or _evaluation_has_explicit_progress(last_info)):
+                            no_progress_steps = 0
+                        else:
+                            no_progress_steps += 1
                     previous_action_id = action_id
-                    previous_progress_signature = progress_signature
+                    if progress_signature is not None:
+                        previous_progress_signature = progress_signature
+                        previous_state_signature = state_signature
                     previous_screen_signature = screen_signature
 
                     def print_eval_table(title):
@@ -5602,7 +6007,8 @@ if __name__ == "__main__":
                             ("Progress", f"starter={last_info.get('starter_flag', '?')} | Pokédex={last_info.get('pokedex_flag', '?')} "
                              f"| tiles={last_info.get('unique_tiles_episode', '?')} | maps={last_info.get('unique_maps_episode', '?')} "
                              f"| story flags={last_info.get('story_flags_episode', '?')}"),
-                            ("Stagnation", f"same action/no state progress={same_action_no_progress_steps}/{EVAL_STAGNATION_STEPS} "
+                            ("Stagnation", f"no meaningful progress={no_progress_steps}/{EVAL_NO_PROGRESS_STEPS} "
+                             f"| same action/no state={same_action_no_progress_steps}/{EVAL_STAGNATION_STEPS} "
                              f"| same action + same screen={same_action_same_screen_steps}/{EVAL_STAGNATION_STEPS}"),
                             ("Action histogram", _format_action_distribution(episode_action_counts)),
                         ]
@@ -5619,16 +6025,21 @@ if __name__ == "__main__":
                             episode_steps = int(last_info["episode"].get("l", episode_steps))
                         break
 
-                    if (not episode_success and (
+                    if not episode_success and (
                         same_action_same_screen_steps >= EVAL_STAGNATION_STEPS
                         or same_action_no_progress_steps >= EVAL_STAGNATION_STEPS * 2
-                    )):
+                        or no_progress_steps >= EVAL_NO_PROGRESS_STEPS
+                    ):
                         episode_outcome = "STAGNATED"
-                        stagnation_reason = (
-                            "same action with unchanged screen/state"
-                            if same_action_same_screen_steps >= EVAL_STAGNATION_STEPS
-                            else "same action with unchanged game-state telemetry"
-                        )
+                        if same_action_same_screen_steps >= EVAL_STAGNATION_STEPS:
+                            stagnation_reason = "same action with unchanged screen/state"
+                        elif same_action_no_progress_steps >= EVAL_STAGNATION_STEPS * 2:
+                            stagnation_reason = "same action with unchanged game-state telemetry"
+                        else:
+                            stagnation_reason = (
+                                f"no meaningful game progress for {no_progress_steps:,} actions "
+                                "(button changes and movement within already explored tiles do not count)"
+                            )
                         print_eval_table("POKÉMON EMERALD RL — STAGNATION DETECTED")
                         print(
                             f"[Evaluation Warning] Ended this test early after {episode_steps:,} actions: {stagnation_reason}. "
@@ -5679,6 +6090,20 @@ if __name__ == "__main__":
                     "unique_tiles": last_info.get("unique_tiles_episode"),
                     "unique_maps": last_info.get("unique_maps_episode"),
                     "story_flags_episode": last_info.get("story_flags_episode"),
+                    "trainer_flags_episode": last_info.get("trainer_flags_episode"),
+                    "flag_telemetry_invalid_steps": int(last_info.get("flag_telemetry_invalid_steps", 0)),
+                    "trainer_flag_telemetry_invalid_steps": int(last_info.get("trainer_flag_telemetry_invalid_steps", 0)),
+                    "flag_telemetry_valid": bool(last_info.get("flag_telemetry_valid", False)),
+                    "trainer_flag_telemetry_valid": bool(last_info.get("trainer_flag_telemetry_valid", False)),
+                    "saveblock_pointer_stable": bool(last_info.get("saveblock_pointer_stable", False)),
+                    "story_flag_regressions": list(last_info.get("story_flag_regressions", ())),
+                    "badge_flag_regressions": int(last_info.get("badge_flag_regressions", 0)),
+                    "trainer_flag_regressions": list(last_info.get("trainer_flag_regressions", ())),
+                    "raw_flag_bytes": dict(last_info.get("raw_flag_bytes", {})),
+                    "starter_flag_raw": last_info.get("starter_flag_raw"),
+                    "starter_flag": bool(last_info.get("starter_flag", False)),
+                    "party_experience_gained": int(episode_experience_gained),
+                    "stagnation_reason": last_info.get("stagnation_reason"),
                     "reward_components": {
                         str(key): float(value) for key, value in reward_components.items()
                         if isinstance(value, (int, float, np.integer, np.floating)) and math.isfinite(float(value))
@@ -5693,6 +6118,10 @@ if __name__ == "__main__":
                      f"| badges={last_info.get('badge_count', '?')}"),
                     ("Exploration", f"tiles={last_info.get('unique_tiles_episode', '?')} | maps={last_info.get('unique_maps_episode', '?')} "
                      f"| story flags={last_info.get('story_flags_episode', '?')}"),
+                    ("Flag telemetry", f"stable={last_info.get('flag_telemetry_valid', False)} | trainer stable={last_info.get('trainer_flag_telemetry_valid', False)} "
+                     f"| pointer stable={last_info.get('saveblock_pointer_stable', False)} | invalid samples={last_info.get('flag_telemetry_invalid_steps', 0)} "
+                     f"| starter raw/effective={last_info.get('starter_flag_raw')}/{last_info.get('starter_flag', False)} "
+                     f"| regressions={len(last_info.get('story_flag_regressions', ())) + len(last_info.get('trainer_flag_regressions', ())) + int(last_info.get('badge_flag_regressions', 0)).bit_count()}"),
                     ("Actions", _format_action_distribution(episode_action_counts)),
                 ]
                 print("\n" + _format_progress_table(
@@ -5744,6 +6173,17 @@ if __name__ == "__main__":
                     "timeouts": int(sum(1 for _, _, _, outcome in results if outcome == "TIMEOUT")),
                     "stagnations": int(sum(1 for _, _, _, outcome in results if outcome == "STAGNATED")),
                     "episodes": detailed_results,
+                    "flag_telemetry_invalid_steps": int(sum(item.get("flag_telemetry_invalid_steps", 0) for item in detailed_results)),
+                    "trainer_flag_telemetry_invalid_steps": int(sum(item.get("trainer_flag_telemetry_invalid_steps", 0) for item in detailed_results)),
+                    "flag_telemetry_integrity_ok": bool(all(item.get("flag_telemetry_invalid_steps", 0) == 0 for item in detailed_results)),
+                    "trainer_flag_telemetry_integrity_ok": bool(all(item.get("trainer_flag_telemetry_invalid_steps", 0) == 0 for item in detailed_results)),
+                    "saveblock_pointer_integrity_ok": bool(all(item.get("saveblock_pointer_stable", False) for item in detailed_results)),
+                    "persistent_flag_regressions": int(sum(
+                        len(item.get("story_flag_regressions", ()))
+                        + int(item.get("badge_flag_regressions", 0)).bit_count()
+                        + len(item.get("trainer_flag_regressions", ()))
+                        for item in detailed_results
+                    )),
                 }
                 report_path = os.path.join(LOG_DIR, f"evaluation_{TIMESTAMP_STR}_{os.getpid()}.json")
                 try:

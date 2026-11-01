@@ -10,9 +10,18 @@ import math
 from numbers import Real
 from pathlib import Path
 
-CURRICULUM_PLAN_ID = "emerald_intro_v4"
+CURRICULUM_PLAN_ID = "emerald_intro_v5"
+
+# These objectives rely on persistent event/badge bits, not just map and party data.
+OBJECTIVES_REQUIRING_FLAG_TELEMETRY = frozenset({
+    "defeat_rival",
+    "return_birch_lab",
+    "pokedex",
+    "first_badge",
+})
 
 # BPEE map IDs observed/decoded by this project.
+LITTLEROOT_TOWN_MAP_ID = 9
 ROUTE_101_MAP_ID = 16
 OLDALE_TOWN_MAP_ID = 10
 ROUTE_103_MAP_ID = 18
@@ -29,6 +38,7 @@ POKEDEX_OBTAINED_FLAG_ID = 0x861  # FLAG_SYS_POKEDEX_GET
 STAGES = (
     "starter",
     "leave_birch_lab",
+    "reach_route101",
     "reach_oldale",
     "reach_route103",
     "defeat_rival",
@@ -43,8 +53,12 @@ OBJECTIVE_DEFINITIONS = {
         "description": "Obtain the starter, finish the opening wild battle, and reach Birch's lab.",
     },
     "leave_birch_lab": {
-        "label": "leave Birch's Lab via Route 101",
-        "description": "Complete Birch's lab introduction and exit onto Route 101.",
+        "label": "exit Birch's Lab into Littleroot Town",
+        "description": "Complete Birch's lab introduction and enter Littleroot Town (map 9).",
+    },
+    "reach_route101": {
+        "label": "reach Route 101",
+        "description": "Navigate from Littleroot Town onto Route 101 (map 16).",
     },
     "reach_oldale": {
         "label": "reach Oldale Town",
@@ -72,6 +86,39 @@ OBJECTIVE_DEFINITIONS = {
     },
 }
 OBJECTIVE_LABELS = {name: definition["label"] for name, definition in OBJECTIVE_DEFINITIONS.items()}
+
+OBJECTIVE_TARGET_MAPS = {
+    "leave_birch_lab": LITTLEROOT_TOWN_MAP_ID,
+    "reach_route101": ROUTE_101_MAP_ID,
+    "reach_oldale": OLDALE_TOWN_MAP_ID,
+    "reach_route103": ROUTE_103_MAP_ID,
+    "return_birch_lab": BIRCH_LAB_MAP_ID,
+}
+
+# Per-objective episode limits, expressed as PPO rollouts per environment.
+# The configurator uses these for training episode horizons; the curriculum
+# controller uses the same values for evaluation so an early objective never
+# inherits the much longer timeout required by a later stage.
+STAGE_EPISODE_ROLLOUTS: dict[str, int] = {
+    "starter": 6,
+    "leave_birch_lab": 15,
+    "reach_route101": 20,
+    "reach_oldale": 20,
+    "reach_route103": 24,
+    "defeat_rival": 32,
+    "return_birch_lab": 40,
+    "pokedex": 8,
+    "first_badge": 64,
+}
+DEFAULT_STAGE_EPISODE_ROLLOUTS = 24
+
+
+def stage_episode_rollouts(stage: str) -> int:
+    """Return the shared per-stage PPO-rollout horizon."""
+    key = str(stage or "").strip().lower()
+    if key not in STAGES:
+        raise ValueError(f"Unknown stage {key!r}; choose one of: {', '.join(STAGES)}")
+    return STAGE_EPISODE_ROLLOUTS.get(key, DEFAULT_STAGE_EPISODE_ROLLOUTS)
 
 
 def stage_start_state_path(
@@ -232,6 +279,14 @@ def objective_satisfied(objective, state):
         raise ValueError(
             f"Unknown objective {objective!r}; expected one of " + ", ".join(OBJECTIVE_DEFINITIONS)
         )
+    if isinstance(state, dict) and state.get("saveblock_pointer_stable", True) is False:
+        return False
+    if (
+        objective in OBJECTIVES_REQUIRING_FLAG_TELEMETRY
+        and isinstance(state, dict)
+        and state.get("flag_telemetry_valid", True) is False
+    ):
+        return False
     metrics = _state_metrics(state)
     if metrics is None:
         return False
@@ -243,6 +298,8 @@ def objective_satisfied(objective, state):
         # opening battle and lab return are complete. Do not terminate on party_count alone.
         return party and map_id == BIRCH_LAB_MAP_ID
     if objective == "leave_birch_lab":
+        return party and map_id == LITTLEROOT_TOWN_MAP_ID
+    if objective == "reach_route101":
         return party and map_id == ROUTE_101_MAP_ID
     if objective == "reach_oldale":
         return party and map_id == OLDALE_TOWN_MAP_ID
@@ -271,11 +328,16 @@ def objective_start_error(objective, state, *, route_101_map_id=ROUTE_101_MAP_ID
     The normal success detector will mark that stage complete on its first step.
     """
     objective = str(objective or "").strip().lower()
-    metrics = _state_metrics(state)
     if objective not in OBJECTIVE_DEFINITIONS:
         return "unknown objective; choose one of: " + ", ".join(OBJECTIVE_DEFINITIONS)
+    if isinstance(state, dict) and state.get("saveblock_pointer_stable", True) is False:
+        return "SaveBlock1 pointer changed during the state read; map/position telemetry is not trustworthy"
+    metrics = _state_metrics(state)
     if metrics is None:
         return "game state is missing valid party, map, badge, or story-flag telemetry"
+    requires_flags = objective == "starter" or objective in OBJECTIVES_REQUIRING_FLAG_TELEMETRY
+    if requires_flags and isinstance(state, dict) and state.get("flag_telemetry_valid", True) is False:
+        return "the SaveBlock1 event/badge flag snapshot is unstable; this objective requires verified flags"
     party = metrics["party_count"] >= 1 and metrics["party_levels"] >= 1
     map_id = metrics["map_id"]
     flags = metrics["story_flags"]
@@ -294,8 +356,22 @@ def objective_start_error(objective, state, *, route_101_map_id=ROUTE_101_MAP_ID
     if objective == "leave_birch_lab":
         if not party:
             return "the leave-the-lab stage requires a valid starter in the live party"
-        if map_id not in {BIRCH_LAB_MAP_ID, ROUTE_101_MAP_ID}:
-            return f"the leave-the-lab stage must start in Birch's Lab (or already be on Route 101); current map_id={map_id}"
+        if map_id not in {BIRCH_LAB_MAP_ID, LITTLEROOT_TOWN_MAP_ID}:
+            return (
+                "the leave-the-lab stage must start in Birch's Lab "
+                f"(map {BIRCH_LAB_MAP_ID}) or already be in Littleroot Town "
+                f"(map {LITTLEROOT_TOWN_MAP_ID}); current map_id={map_id}"
+            )
+        return None
+    if objective == "reach_route101":
+        if not party:
+            return "the Route 101 stage requires a valid starter in the live party"
+        if map_id not in {LITTLEROOT_TOWN_MAP_ID, ROUTE_101_MAP_ID}:
+            return (
+                "the Route 101 stage must start in Littleroot Town "
+                f"(map {LITTLEROOT_TOWN_MAP_ID}) or already be on Route 101 "
+                f"(map {ROUTE_101_MAP_ID}); current map_id={map_id}"
+            )
         return None
     if objective == "reach_oldale":
         if not party:

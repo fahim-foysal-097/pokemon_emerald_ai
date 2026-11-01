@@ -97,9 +97,9 @@ class MainLogicTests(unittest.TestCase):
             return 0
 
         env._read8 = read8
-        env._read_badge_flags = lambda _pointer: 0
+        env._read_badge_flags = lambda _pointer, _snapshot=None: 0
         env._read_player_position = lambda _pointer: (4, 5)
-        env._read_story_flags = lambda _pointer: set()
+        env._read_story_flags = lambda _pointer, _snapshot=None: set()
         flag_reads = []
 
         def read_trainer_flags(pointer):
@@ -115,8 +115,9 @@ class MainLogicTests(unittest.TestCase):
 
         refreshed_state = env._read_game_state(include_trainer_flags=True)
         self.assertEqual(refreshed_state["trainer_flags"], {0x500})
-        self.assertEqual(flag_reads, [saveblock])
+        self.assertEqual(flag_reads, [saveblock, saveblock])
         self.assertEqual(env._cached_trainer_flags, {0x500})
+        self.assertTrue(env._cached_trainer_flags_valid)
 
     def test_headless_audio_drain_reuses_scratch_and_skips_numpy_copy(self):
         class FakeFFI:
@@ -450,6 +451,70 @@ class MainLogicTests(unittest.TestCase):
         self.assertIn(0x500, state["trainer_flags"])
         self.assertNotIn("route101_state", state)
 
+    def test_live_party_is_authoritative_for_effective_starter_flag(self):
+        env = object.__new__(main.EmeraldEnv)
+        memory: dict[int, int] = {}
+        env._read8 = lambda address: memory.get(int(address), 0)
+        saveblock = 0x02010000
+        self.byte_map_write(memory, main.SAVE_BLOCK1_PTR_ADDRESS, saveblock, 4)
+        memory[main.PLAYER_PARTY_COUNT_ADDRESS] = 1
+        memory[main.PLAYER_PARTY_ADDRESS + main.PARTY_LEVEL_OFFSET] = 5
+        memory[saveblock + main.SAVE_BLOCK1_LOCATION_OFFSET] = 0
+        memory[saveblock + main.SAVE_BLOCK1_LOCATION_OFFSET + 1] = 9
+        state = env._read_game_state()
+        self.assertTrue(state["flag_telemetry_valid"])
+        self.assertTrue(state["starter_obtained"])
+        self.assertIn(main.STARTER_OBTAINED_FLAG_ID, state["story_flags"])
+        self.assertFalse(state["starter_flag_raw"])
+        self.assertEqual(state["party_count"], 1)
+        self.assertEqual(state["party_levels"], 5)
+
+    def test_unstable_saveblock_pointer_invalidates_map_coordinates(self):
+        env = object.__new__(main.EmeraldEnv)
+        memory: dict[int, int] = {}
+        env._read8 = lambda address: memory.get(int(address), 0)
+        first_pointer = 0x02010000
+        second_pointer = 0x02011000
+        env._read_saveblock1_pointer = iter((first_pointer, second_pointer)).__next__
+        memory[first_pointer + main.SAVE_BLOCK1_LOCATION_OFFSET] = 0
+        memory[first_pointer + main.SAVE_BLOCK1_LOCATION_OFFSET + 1] = 9
+        memory[first_pointer + main.SAVE_BLOCK1_POS_X_OFFSET] = 7
+        memory[first_pointer + main.SAVE_BLOCK1_POS_Y_OFFSET] = 17
+
+        state = env._read_game_state()
+
+        self.assertFalse(state["saveblock_pointer_stable"])
+        self.assertFalse(state["flag_telemetry_valid"])
+        self.assertEqual(state["map_id"], -1)
+        self.assertIsNone(state["player_x"])
+        self.assertIsNone(state["player_y"])
+        self.assertEqual(state["raw_map_id"], 9)
+        self.assertEqual(state["raw_player_x"], 7)
+        self.assertEqual(state["raw_player_y"], 17)
+
+    def test_verified_persistent_flags_are_latched_and_regressions_are_diagnosed(self):
+        env = object.__new__(main.EmeraldEnv)
+        memory: dict[int, int] = {}
+        env._read8 = lambda address: memory.get(int(address), 0)
+        saveblock = 0x02010000
+        self.byte_map_write(memory, main.SAVE_BLOCK1_PTR_ADDRESS, saveblock, 4)
+        env._last_verified_story_flags = {main.CLOCK_SET_FLAG_ID, main.STARTER_OBTAINED_FLAG_ID}
+        env._last_verified_badge_flags = 1
+        env._last_verified_trainer_flags = {0x500}
+        env._cached_trainer_flags = {0x500}
+        env._cached_trainer_flags_valid = True
+
+        state = env._read_game_state(include_trainer_flags=True)
+
+        self.assertTrue(state["flag_telemetry_valid"])
+        self.assertIn(main.STARTER_OBTAINED_FLAG_ID, state["story_flags"])
+        self.assertFalse(state["starter_flag_raw"])
+        self.assertEqual(state["badge_flags"], 1)
+        self.assertEqual(state["badge_flag_regressions"], 1)
+        self.assertIn(main.STARTER_OBTAINED_FLAG_ID, state["story_flag_regressions"])
+        self.assertIn(0x500, state["trainer_flags"])
+        self.assertIn(0x500, state["trainer_flag_regressions"])
+
     def test_invalid_saveblock_pointer_is_rejected(self):
         env = object.__new__(main.EmeraldEnv)
         env._read8 = lambda address: 0
@@ -466,7 +531,10 @@ class MainLogicTests(unittest.TestCase):
             env._read_game_state()
 
     def test_objective_registry_and_success_conditions(self):
-        from curriculum_objectives import BIRCH_LAB_MAP_ID, RIVAL_DEFEATED_ROUTE103_FLAG_ID
+        from curriculum_objectives import (
+            BIRCH_LAB_MAP_ID, LITTLEROOT_TOWN_MAP_ID, ROUTE_101_MAP_ID,
+            RIVAL_DEFEATED_ROUTE103_FLAG_ID,
+        )
 
         starter_state = {
             "party_count": 1, "party_levels": 5, "map_id": BIRCH_LAB_MAP_ID,
@@ -477,12 +545,30 @@ class MainLogicTests(unittest.TestCase):
         self.assertFalse(main._objective_satisfied("starter", dict(starter_state, party_count=7)))
         self.assertFalse(main._objective_satisfied("starter", dict(starter_state, party_levels=601)))
 
+        littleroot_state = dict(starter_state, map_id=LITTLEROOT_TOWN_MAP_ID)
+        self.assertTrue(main._objective_satisfied("leave_birch_lab", littleroot_state))
+        self.assertFalse(main._objective_satisfied("leave_birch_lab", dict(starter_state, map_id=ROUTE_101_MAP_ID)))
+        route101_state = dict(starter_state, map_id=ROUTE_101_MAP_ID)
+        self.assertTrue(main._objective_satisfied("reach_route101", route101_state))
+        self.assertFalse(main._objective_satisfied(
+            "leave_birch_lab", dict(littleroot_state, saveblock_pointer_stable=False)
+        ))
+        self.assertIn(
+            "SaveBlock1 pointer changed",
+            main._training_start_validation_error(
+                dict(littleroot_state, saveblock_pointer_stable=False), objective="reach_route101"
+            ),
+        )
+
         pokedex_state = dict(starter_state, story_flags={
             main.STARTER_OBTAINED_FLAG_ID,
             RIVAL_DEFEATED_ROUTE103_FLAG_ID,
             main.POKEDEX_OBTAINED_FLAG_ID,
         })
         self.assertTrue(main._objective_satisfied("pokedex", pokedex_state))
+        self.assertFalse(main._objective_satisfied(
+            "pokedex", dict(pokedex_state, flag_telemetry_valid=False)
+        ))
         self.assertFalse(main._objective_satisfied(
             "pokedex", dict(pokedex_state, story_flags={main.POKEDEX_OBTAINED_FLAG_ID})
         ))
@@ -506,13 +592,22 @@ class MainLogicTests(unittest.TestCase):
         }
         self.assertIn("starter in the live party", main._training_start_validation_error(base, objective="pokedex"))
         self.assertIn("valid Pokémon in the live party", main._training_start_validation_error(base, objective="first_badge"))
+        self.assertIn(
+            "flag snapshot is unstable",
+            main._training_start_validation_error(
+                dict(base, flag_telemetry_valid=False), objective="starter"
+            ),
+        )
 
         starter_milestone = dict(base, map_id=BIRCH_LAB_MAP_ID, party_count=1, party_levels=5, story_flags={
             main.CLOCK_SET_FLAG_ID, main.STARTER_OBTAINED_FLAG_ID
         })
         self.assertIsNone(main._training_start_validation_error(starter_milestone, objective="leave_birch_lab"))
 
-        route101_milestone = dict(starter_milestone, map_id=main.ROUTE_101_MAP_ID)
+        littleroot_milestone = dict(starter_milestone, map_id=9)
+        self.assertIsNone(main._training_start_validation_error(littleroot_milestone, objective="reach_route101"))
+
+        route101_milestone = dict(littleroot_milestone, map_id=main.ROUTE_101_MAP_ID)
         self.assertIsNone(main._training_start_validation_error(route101_milestone, objective="reach_oldale"))
 
         oldale_milestone = dict(route101_milestone, map_id=OLDALE_TOWN_MAP_ID)
@@ -692,6 +787,50 @@ class MainLogicTests(unittest.TestCase):
         self.assertLess(second, first)
         self.assertLess(tenth, second)
         self.assertGreaterEqual(main._diminishing_novelty_reward(base, -5), 0.0)
+
+    def test_evaluation_progress_signature_ignores_position_but_tracks_actual_progress(self):
+        first = {
+            "map_id": 260, "player_x": 3, "player_y": 2, "party_count": 1,
+            "party_levels": 5, "badge_count": 0, "starter_flag": True,
+            "pokedex_flag": False, "story_flags": (0x51, 0x52),
+            "trainer_flag_count": 0, "unique_tiles_episode": 8,
+            "unique_maps_episode": 1, "story_flags_episode": 4,
+            "trainer_flags_episode": 0,
+        }
+        moved_within_known_area = dict(first, player_x=4, player_y=2)
+        explored_new_tile = dict(first, player_x=4, unique_tiles_episode=9)
+        changed_story = dict(first, story_flags=(0x51, 0x52, 0x53), story_flags_episode=5)
+        self.assertEqual(
+            main._evaluation_progress_signature(first),
+            main._evaluation_progress_signature(moved_within_known_area),
+        )
+        # Repeatedly toggling between two known maps is not new exploration.
+        self.assertEqual(
+            main._evaluation_progress_signature(first),
+            main._evaluation_progress_signature(dict(first, map_id=261)),
+        )
+        self.assertNotEqual(
+            main._evaluation_progress_signature(first),
+            main._evaluation_progress_signature(explored_new_tile),
+        )
+        self.assertNotEqual(
+            main._evaluation_progress_signature(first),
+            main._evaluation_progress_signature(changed_story),
+        )
+        self.assertIsNone(main._evaluation_progress_signature(dict(first, ram_read_failed=True)))
+
+    def test_evaluation_watchdog_ignores_mini_episode_novelty_but_tracks_real_progress(self):
+        # Mini-episode resets clear short-term novelty sets. A previously visited
+        # tile/map can therefore be reported as locally new without cumulative
+        # episode progress; it must not reset the evaluation no-progress timer.
+        self.assertFalse(main._evaluation_has_explicit_progress({"new_tile_discovered": True}))
+        self.assertFalse(main._evaluation_has_explicit_progress({"new_area_discovered": True}))
+        self.assertTrue(main._evaluation_has_explicit_progress({"new_story_flags": 1}))
+        self.assertTrue(main._evaluation_has_explicit_progress({"new_trainer_flags": 1}))
+        self.assertTrue(main._evaluation_has_explicit_progress({"new_badges_this_step": 1}))
+        self.assertTrue(main._evaluation_has_explicit_progress({"party_experience_delta": 120}))
+        self.assertFalse(main._evaluation_has_explicit_progress({"ram_read_failed": True, "new_story_flags": 1}))
+        self.assertFalse(main._evaluation_has_explicit_progress({"new_story_flags": 0, "new_trainer_flags": 0}))
 
     def test_screen_signature_is_stable_and_detects_large_layout_changes(self):
         unchanged_a = np.zeros((main.OBS_HEIGHT, main.OBS_WIDTH, 3), dtype=np.uint8)

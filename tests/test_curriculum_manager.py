@@ -32,11 +32,12 @@ class CurriculumManagerTests(unittest.TestCase):
 
     def test_curriculum_uses_shared_incremental_stage_plan(self):
         from curriculum_objectives import CURRICULUM_PLAN_ID, OBJECTIVE_LABELS, STAGES
-        self.assertEqual(CURRICULUM_PLAN_ID, "emerald_intro_v4")
+        self.assertEqual(CURRICULUM_PLAN_ID, "emerald_intro_v5")
         self.assertEqual(run_curriculum.STAGES, STAGES)
         self.assertEqual(run_curriculum.OBJECTIVE_LABELS, OBJECTIVE_LABELS)
         self.assertLess(STAGES.index("starter"), STAGES.index("leave_birch_lab"))
-        self.assertLess(STAGES.index("leave_birch_lab"), STAGES.index("reach_oldale"))
+        self.assertLess(STAGES.index("leave_birch_lab"), STAGES.index("reach_route101"))
+        self.assertLess(STAGES.index("reach_route101"), STAGES.index("reach_oldale"))
         self.assertLess(STAGES.index("reach_route103"), STAGES.index("defeat_rival"))
         self.assertLess(STAGES.index("return_birch_lab"), STAGES.index("pokedex"))
 
@@ -240,6 +241,70 @@ class CurriculumManagerTests(unittest.TestCase):
         self.assertFalse(run_curriculum.milestone_matches_evaluation(stale, report, "b" * 40, started))
         wrong_rom = dict(manifest, rom_sha1_expected="d" * 40)
         self.assertFalse(run_curriculum.milestone_matches_evaluation(wrong_rom, report, "b" * 40, started))
+
+    def test_archive_screening_environment_propagates_exact_single_episode_request(self):
+        env = run_curriculum.build_evaluation_environment(
+            {"POKEMON_AI_EVAL_EPISODES": "5", "POKEMON_AI_MAX_EPISODE_STEPS": "131072"},
+            stage="leave_birch_lab",
+            start_state=Path("/tmp/starter.state"),
+            requested_episodes=1,
+            deterministic=True,
+            eval_seed="1234",
+            max_episode_steps=30_720,
+            no_progress_steps=4096,
+            checkpoint_path=Path("/tmp/candidate.zip"),
+        )
+        self.assertEqual(env["POKEMON_AI_EVAL_EPISODES"], "1")
+        self.assertEqual(env["POKEMON_AI_EVAL_MAX_EPISODE_STEPS"], "30720")
+        self.assertEqual(env["POKEMON_AI_EVAL_NO_PROGRESS_STEPS"], "4096")
+        self.assertEqual(env["POKEMON_AI_EVAL_CHECKPOINT"], "/tmp/candidate.zip")
+        self.assertEqual(env["POKEMON_AI_MODE"], "evaluate")
+
+    def test_stage_evaluation_step_limit_uses_selected_objective_not_later_stage(self):
+        self.assertEqual(run_curriculum.stage_evaluation_step_limit("leave_birch_lab", 2048), 30_720)
+        self.assertEqual(run_curriculum.stage_evaluation_step_limit("reach_route101", 2048), 40_960)
+        self.assertEqual(run_curriculum.stage_evaluation_step_limit("first_badge", 2048), 131_072)
+        self.assertEqual(run_curriculum.stage_evaluation_step_limit("leave_birch_lab", 2048, 8192), 8192)
+        with self.assertRaises(ValueError):
+            run_curriculum.stage_evaluation_step_limit("leave_birch_lab", 0)
+
+    def test_checkpoint_score_uses_only_non_flag_progress_as_a_secondary_tiebreaker(self):
+        stagnant = {
+            "success_rate": 0.0, "mean_return": 100.0, "mean_steps": 1000,
+            "episodes": [{"unique_tiles": 8, "unique_maps": 1, "story_flags_episode": 400,
+                          "trainer_flags_episode": 453, "party_count": 6, "party_levels": 600,
+                          "badge_count": 8, "party_experience_gained": 0}],
+        }
+        inflated_flags_only = {
+            "success_rate": 0.0, "mean_return": 100.0, "mean_steps": 1000,
+            "episodes": [{"unique_tiles": 8, "unique_maps": 1, "story_flags_episode": 600,
+                          "trainer_flags_episode": 800, "party_count": 6, "party_levels": 600,
+                          "badge_count": 8, "party_experience_gained": 0}],
+        }
+        progressed = {
+            "success_rate": 0.0, "mean_return": -10.0, "mean_steps": 5000,
+            "episodes": [{"unique_tiles": 20, "unique_maps": 2, "story_flags_episode": 0,
+                          "trainer_flags_episode": 0, "party_count": 1, "party_levels": 5,
+                          "badge_count": 0, "party_experience_gained": 1000}],
+        }
+        self.assertEqual(run_curriculum.report_score(inflated_flags_only), run_curriculum.report_score(stagnant))
+        self.assertGreater(run_curriculum.report_score(progressed), run_curriculum.report_score(stagnant))
+
+    def test_v4_early_stage_migrates_without_restarting_completed_starter(self):
+        migrated = run_curriculum.resolve_saved_curriculum_stage({
+            "curriculum_plan": "emerald_intro_v4",
+            "status": "stage_not_mastered",
+            "stage": "leave_birch_lab",
+        })
+        self.assertEqual(migrated, ("leave_birch_lab", "migrated_v4_early_stage"))
+        self.assertEqual(
+            run_curriculum.resolve_saved_curriculum_stage({
+                "curriculum_plan": "emerald_intro_v4",
+                "status": "stage_not_mastered",
+                "stage": "reach_oldale",
+            }),
+            (None, "incompatible_plan"),
+        )
 
     def test_checkpoint_score_prioritizes_success_then_return_then_steps(self):
         base = {"success_rate": 0.0, "mean_return": 20.0, "mean_steps": 1000}

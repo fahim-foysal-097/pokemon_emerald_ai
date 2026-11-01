@@ -33,8 +33,8 @@ from typing import Any
 
 from important_logging import filter_persistent_log_text, is_important_log_line, should_flush_important_log, is_exception_end
 from curriculum_objectives import (
-    CURRICULUM_PLAN_ID, OBJECTIVE_LABELS, STAGES,
-    objective_start_error, stage_start_state_path,
+    CURRICULUM_PLAN_ID, OBJECTIVE_LABELS, OBJECTIVES_REQUIRING_FLAG_TELEMETRY, STAGES,
+    objective_start_error, stage_start_state_path, stage_episode_rollouts,
 )
 
 
@@ -177,21 +177,124 @@ def milestone_matches_evaluation(
     )
 
 
-def report_score(report: dict[str, Any]) -> tuple[float, float, float]:
-    """Rank checkpoints by objective success, then mean return, then fewer steps."""
+def _episode_progress_score(episode: dict[str, Any]) -> float:
+    """Score observable game progress for checkpoint screening, not policy activity."""
+    def nonnegative_int(key: str) -> float:
+        value = episode.get(key, 0)
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if not math.isfinite(number):
+            return 0.0
+        return max(0.0, number)
+
+    # This is deliberately a secondary tiebreaker only. Do not score raw/latched
+    # story flags, trainer flags, party totals or badge counts: those were the exact
+    # telemetry channels that produced inflated scores in the latest evaluation.
+    # Objective success rate is always the first and mandatory promotion signal.
+    return (
+        nonnegative_int("unique_tiles")
+        + 16.0 * nonnegative_int("unique_maps")
+        + nonnegative_int("party_experience_gained") / 100.0
+    )
+
+
+def report_score(report: dict[str, Any]) -> tuple[float, float, float, float]:
+    """Rank checkpoints by success, actual game progress, return, then efficiency."""
     def finite(value: Any, fallback: float) -> float:
         try:
             number = float(value)
         except (TypeError, ValueError, OverflowError):
             return fallback
-        if number != number or number in (float("inf"), float("-inf")):
+        if not math.isfinite(number):
             return fallback
         return number
 
     success_rate = max(0.0, min(1.0, finite(report.get("success_rate"), 0.0)))
+    episodes = report.get("episodes", [])
+    if isinstance(episodes, list) and episodes:
+        progress = sum(
+            _episode_progress_score(item) for item in episodes if isinstance(item, dict)
+        ) / max(1, sum(1 for item in episodes if isinstance(item, dict)))
+    else:
+        # Backward compatibility for older reports that predate progress telemetry.
+        progress = finite(report.get("mean_progress_score"), 0.0)
     mean_return = finite(report.get("mean_return"), float("-inf"))
     mean_steps = finite(report.get("mean_steps"), float("inf"))
-    return success_rate, mean_return, -mean_steps
+    return success_rate, progress, mean_return, -mean_steps
+
+
+RESUMABLE_CURRICULUM_STATUSES = frozenset({
+    "running", "interrupted", "stage_not_mastered",
+    "stage_only_training", "stage_only_budget_complete",
+})
+
+def resolve_saved_curriculum_stage(saved_state: dict[str, Any]) -> tuple[str | None, str]:
+    """Resolve a resumable stage, including the safe v4 -> v5 early-stage migration.
+
+    In v4, `leave_birch_lab` meant reaching Route 101, but the supplied runs actually
+    reached Littleroot Town and were scored as failures. In v5 that existing stage is
+    narrowed to the first verified map transition (Birch's Lab -> Littleroot). Its
+    predecessor is still the exact same `starter.state` milestone, so it is safe to
+    resume without repeating the already-completed starter stage. The new
+    `reach_route101` stage then consumes the freshly produced `leave_birch_lab.state`.
+    Later v4 stages are not migrated because their predecessor chain changed.
+    """
+    if not isinstance(saved_state, dict):
+        return None, "unreadable"
+    if saved_state.get("status") not in RESUMABLE_CURRICULUM_STATUSES:
+        return None, "not_resumable"
+    stage = saved_state.get("stage")
+    if stage not in STAGES:
+        return None, "unknown_stage"
+    plan = saved_state.get("curriculum_plan")
+    if plan == CURRICULUM_PLAN_ID:
+        return stage, "current"
+    if plan == "emerald_intro_v4" and stage in {"starter", "leave_birch_lab"}:
+        return stage, "migrated_v4_early_stage"
+    return None, "incompatible_plan"
+
+
+def stage_evaluation_step_limit(stage: str, n_steps: int, override: int | None = None) -> int:
+    """Resolve an evaluation horizon from the selected objective, not later stages."""
+    if override is not None:
+        if int(override) < 1:
+            raise ValueError("Evaluation step override must be positive")
+        return int(override)
+    if int(n_steps) < 1:
+        raise ValueError("POKEMON_AI_PPO_N_STEPS must be positive")
+    return stage_episode_rollouts(stage) * int(n_steps)
+
+
+def build_evaluation_environment(
+    base_env: dict[str, str], *, stage: str, start_state: Path, requested_episodes: int,
+    deterministic: bool, eval_seed: str, max_episode_steps: int, no_progress_steps: int = 4096,
+    checkpoint_path: Path | None = None,
+) -> dict[str, str]:
+    """Build an isolated, exact evaluation subprocess configuration."""
+    if requested_episodes < 1 or max_episode_steps < 1 or no_progress_steps < 128:
+        raise ValueError("Evaluation episode count/step limit must be positive and no-progress guard >= 128")
+    env = base_env.copy()
+    env.update({
+        "POKEMON_AI_PROFILE": "evaluate",
+        "POKEMON_AI_MODE": "evaluate",
+        "POKEMON_AI_GUI_MODE": "0",
+        "POKEMON_AI_RECORD_VIDEO": "0",
+        "POKEMON_AI_AUTO_START_TENSORBOARD": "0",
+        "POKEMON_AI_OBJECTIVE": stage,
+        "POKEMON_AI_TRAINING_START_STATE": str(start_state),
+        # Critical: episode_count must reach the child, not just report validation.
+        "POKEMON_AI_EVAL_EPISODES": str(int(requested_episodes)),
+        "POKEMON_AI_EVAL_DETERMINISTIC": "1" if deterministic else "0",
+        "POKEMON_AI_EVAL_MAX_EPISODE_STEPS": str(int(max_episode_steps)),
+        "POKEMON_AI_EVAL_NO_PROGRESS_STEPS": str(int(no_progress_steps)),
+        "POKEMON_AI_EVAL_SEED": str(eval_seed),
+    })
+    env.pop("POKEMON_AI_EVAL_CHECKPOINT", None)
+    if checkpoint_path is not None:
+        env["POKEMON_AI_EVAL_CHECKPOINT"] = str(checkpoint_path)
+    return env
 
 
 def file_sha1(path: Path) -> str:
@@ -599,6 +702,21 @@ def validate_stage_start_state(
         raise RuntimeError(f"Invalid savestate path in {manifest_path}: {exc}") from exc
 
     state_metrics = manifest.get("state")
+    if not isinstance(state_metrics, dict):
+        raise RuntimeError(f"Prerequisite metadata {manifest_path} has no decoded state object.")
+    if state_metrics.get("saveblock_pointer_stable", True) is False:
+        raise RuntimeError(
+            f"Prerequisite metadata {manifest_path} records an unstable SaveBlock1 pointer; "
+            "recreate the milestone from a verified game state."
+        )
+    if (
+        stage in OBJECTIVES_REQUIRING_FLAG_TELEMETRY
+        and state_metrics.get("flag_telemetry_valid", True) is False
+    ):
+        raise RuntimeError(
+            f"Prerequisite metadata {manifest_path} records unstable event/badge flags required by {stage}; "
+            "recreate the milestone from a verified game state."
+        )
     prerequisite_error = objective_start_error(stage, state_metrics)
     if prerequisite_error:
         raise RuntimeError(
@@ -816,6 +934,16 @@ def main() -> int:
     chunk_steps = int_setting(cfg, "POKEMON_AI_CURRICULUM_CHUNK_TIMESTEPS", 250_000)
     max_chunks = int_setting(cfg, "POKEMON_AI_CURRICULUM_MAX_CHUNKS_PER_STAGE", 8)
     eval_episodes = int_setting(cfg, "POKEMON_AI_CURRICULUM_EVAL_EPISODES", 5)
+    ppo_n_steps = int_setting(cfg, "POKEMON_AI_PPO_N_STEPS", 2048)
+    eval_step_override_raw = os.environ.get(
+        "POKEMON_AI_CURRICULUM_EVAL_MAX_EPISODE_STEPS",
+        cfg.get("POKEMON_AI_CURRICULUM_EVAL_MAX_EPISODE_STEPS", ""),
+    ).strip()
+    eval_step_override = int_setting(
+        {"POKEMON_AI_CURRICULUM_EVAL_MAX_EPISODE_STEPS": eval_step_override_raw},
+        "POKEMON_AI_CURRICULUM_EVAL_MAX_EPISODE_STEPS", 1,
+    ) if eval_step_override_raw else None
+    eval_no_progress_steps = int_setting(cfg, "POKEMON_AI_EVAL_NO_PROGRESS_STEPS", 4096, minimum=128)
     threshold = float_setting(cfg, "POKEMON_AI_CURRICULUM_SUCCESS_RATE", 0.8)
     deterministic = bool_setting(cfg, "POKEMON_AI_CURRICULUM_EVAL_DETERMINISTIC", True)
     compare_checkpoints = int_setting(cfg, "POKEMON_AI_CURRICULUM_COMPARE_CHECKPOINTS", 2, minimum=0)
@@ -836,19 +964,26 @@ def main() -> int:
     if current_stage is None and run_state_path.is_file():
         try:
             saved_state = json.loads(run_state_path.read_text(encoding="utf-8"))
-            if saved_state.get("status") in {"running", "interrupted", "stage_not_mastered", "stage_only_training", "stage_only_budget_complete"} and saved_state.get("stage") in STAGES:
-                if saved_state.get("curriculum_plan") == CURRICULUM_PLAN_ID:
-                    current_stage = saved_state["stage"]
-                    if stage_only:
-                        print(f"[Curriculum] Stage-only mode selected saved stage {current_stage!r}; evaluations/promotions are disabled.", flush=True)
-                    else:
-                        print(f"[Curriculum] Resuming from saved stage {current_stage!r} (it will be re-evaluated first).", flush=True)
-                else:
+            resolved_stage, resolution = resolve_saved_curriculum_stage(saved_state)
+            if resolved_stage is not None:
+                current_stage = resolved_stage
+                if resolution == "migrated_v4_early_stage":
                     print(
-                        "[Curriculum] Previous stage plan is incompatible with this expanded objective sequence; "
-                        "restarting stage selection at 'starter'. The existing model checkpoint is retained and "
-                        "will be evaluated before any retraining.", flush=True
+                        f"[Curriculum] Migrated saved v4 stage {current_stage!r} to v5. "
+                        "The completed starter milestone is preserved; `leave_birch_lab` now "
+                        "ends at Littleroot Town, and Route 101 is a separate next stage.",
+                        flush=True,
                     )
+                elif stage_only:
+                    print(f"[Curriculum] Stage-only mode selected saved stage {current_stage!r}; evaluations/promotions are disabled.", flush=True)
+                else:
+                    print(f"[Curriculum] Resuming from saved stage {current_stage!r} (it will be re-evaluated first).", flush=True)
+            elif resolution == "incompatible_plan":
+                print(
+                    "[Curriculum] Previous stage plan is incompatible with this objective sequence; "
+                    "restarting stage selection at 'starter'. The existing model checkpoint is retained.",
+                    flush=True,
+                )
         except (OSError, json.JSONDecodeError, AttributeError):
             print("[Curriculum Warning] Prior curriculum state is unreadable; starting from the first stage.", flush=True)
     if current_stage is None:
@@ -886,6 +1021,7 @@ def main() -> int:
         print(f" Evaluation gate    : {'deterministic' if deterministic else 'stochastic'}; "
               f"{eval_episodes} episodes; success rate >= {threshold:.0%}", flush=True)
     print(f" Train chunk        : {chunk_steps:,} transitions; maximum {max_chunks} chunks for this invocation/stage", flush=True)
+    print(f" Evaluation guard   : stage-specific action cap; stop after {eval_no_progress_steps:,} actions without meaningful game progress", flush=True)
     if not stage_only:
         print(f" Checkpoint recovery: compare up to {compare_checkpoints} recent distinct archived models when the current model misses the gate", flush=True)
     print(" Milestones         : " + " -> ".join(STAGES), flush=True)
@@ -908,9 +1044,10 @@ def main() -> int:
             stage_start = stage_start_state_path(root, stage, initial_state)
             print(f"\n[Dry-run] Stage {stage}: start state={stage_start}", flush=True)
             if checkpoint.is_file():
-                print(f"  1. Evaluate current checkpoint ({eval_episodes} episodes): {checkpoint}", flush=True)
+                stage_eval_limit = stage_evaluation_step_limit(stage, ppo_n_steps, eval_step_override)
+                print(f"  1. Evaluate current checkpoint ({eval_episodes} episodes; max {stage_eval_limit:,} actions each): {checkpoint}", flush=True)
                 if compare_checkpoints:
-                    print(f"  2. If below gate, screen up to {compare_checkpoints} recent distinct archives and fully re-evaluate the best candidate.", flush=True)
+                    print(f"  2. If below gate, screen up to {compare_checkpoints} recent distinct archives (1 episode each) and fully re-evaluate the best candidate.", flush=True)
             elif stage == "starter":
                 print("  1. No checkpoint yet; start a fresh model from the canonical pre-starter state.", flush=True)
             else:
@@ -962,18 +1099,18 @@ def main() -> int:
         requested_episodes = int(episode_count if episode_count is not None else eval_episodes)
         report_before = set(log_dir.glob("evaluation_*.json")) if log_dir.is_dir() else set()
         evaluation_started_unix = time.time()
-        env = base_env.copy()
-        env["POKEMON_AI_PROFILE"] = "evaluate"
-        env["POKEMON_AI_MODE"] = "evaluate"
-        env["POKEMON_AI_GUI_MODE"] = "0"
-        env["POKEMON_AI_RECORD_VIDEO"] = "0"
-        env["POKEMON_AI_AUTO_START_TENSORBOARD"] = "0"
-        env["POKEMON_AI_OBJECTIVE"] = stage
-        env["POKEMON_AI_TRAINING_START_STATE"] = str(start_state)
-        env.pop("POKEMON_AI_EVAL_CHECKPOINT", None)
-        if checkpoint_path is not None:
-            env["POKEMON_AI_EVAL_CHECKPOINT"] = str(checkpoint_path)
-        env["POKEMON_AI_EVAL_SEED"] = os.environ.get("POKEMON_AI_EVAL_SEED", cfg.get("POKEMON_AI_EVAL_SEED", "1234"))
+        stage_eval_limit = stage_evaluation_step_limit(stage, ppo_n_steps, eval_step_override)
+        env = build_evaluation_environment(
+            base_env,
+            stage=stage,
+            start_state=start_state,
+            requested_episodes=requested_episodes,
+            deterministic=deterministic,
+            eval_seed=os.environ.get("POKEMON_AI_EVAL_SEED", cfg.get("POKEMON_AI_EVAL_SEED", "1234")),
+            max_episode_steps=stage_eval_limit,
+            no_progress_steps=eval_no_progress_steps,
+            checkpoint_path=checkpoint_path,
+        )
         command = [str(python), "main.py"]
         stream_command(command, env, root, run_log_path, args.dry_run)
         if args.dry_run:
@@ -984,6 +1121,11 @@ def main() -> int:
         report = json.loads(report_path.read_text(encoding="utf-8"))
         if report.get("objective") != stage or report.get("mode") != ("deterministic" if deterministic else "stochastic"):
             raise RuntimeError(f"Evaluation report does not match the requested stage/mode: {report_path}")
+        if int(report.get("episodes_requested", 0)) != requested_episodes:
+            raise RuntimeError(
+                f"Evaluation report requested {report.get('episodes_requested')} episodes; "
+                f"controller requested {requested_episodes}. Refusing to promote."
+            )
         if int(report.get("episodes_completed", 0)) != requested_episodes:
             raise RuntimeError(
                 f"Evaluation report contains {report.get('episodes_completed')} completed episodes; "
@@ -1046,6 +1188,7 @@ def main() -> int:
         can unlock the next objective.
         """
         baseline_score = report_score(baseline_report)
+        baseline_success_rate = baseline_score[0]
         best_screen_score = baseline_score
         best_screen_path: Path | None = None
         candidates = archived_checkpoint_candidates(root, model_name, checkpoint, compare_checkpoints)
@@ -1064,7 +1207,15 @@ def main() -> int:
             if screen_report is None:
                 continue
             score = report_score(screen_report)
-            print(f"[Checkpoint Compare] {candidate.name} score={score} baseline={baseline_score}", flush=True)
+            print(
+                f"[Checkpoint Compare] {candidate.name} score={score} baseline={baseline_score} "
+                f"(1-episode screen)", flush=True
+            )
+            # A candidate that does not complete the selected objective in its
+            # screening run cannot advance to full evaluation based on wandering,
+            # stale flags, or a larger exploration counter.
+            if score[0] <= baseline_success_rate or score[0] <= 0.0:
+                continue
             if score > best_screen_score:
                 best_screen_score = score
                 best_screen_path = candidate
@@ -1084,8 +1235,16 @@ def main() -> int:
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
             print(f"[Curriculum Warning] Full candidate evaluation failed: {exc}", flush=True)
             return baseline_report
-        if full_report is None or report_score(full_report) <= baseline_score:
-            print("[Checkpoint Compare] Candidate did not outperform the baseline on the full test; keep current model.", flush=True)
+        if full_report is None:
+            print("[Checkpoint Compare] Candidate full evaluation is missing; keep current model.", flush=True)
+            return baseline_report
+        full_score = report_score(full_report)
+        if full_score[0] <= baseline_success_rate:
+            print(
+                "[Checkpoint Compare] Candidate did not improve objective success rate on the full test; "
+                "secondary counters cannot override that result. Keep current model.",
+                flush=True,
+            )
             return baseline_report
 
         backup = activate_checkpoint_candidate(
@@ -1093,7 +1252,7 @@ def main() -> int:
         )
         print(
             f"[Checkpoint Compare] Activated improved checkpoint {best_screen_path.name}; "
-            f"previous model backup={backup if backup else 'not needed'}; full score={report_score(full_report)}",
+            f"previous model backup={backup if backup else 'not needed'}; full score={full_score}",
             flush=True,
         )
         full_report["selected_checkpoint_activated"] = True

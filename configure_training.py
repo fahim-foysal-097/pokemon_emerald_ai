@@ -41,6 +41,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from curriculum_objectives import (
+    DEFAULT_STAGE_EPISODE_ROLLOUTS,
+    STAGE_EPISODE_ROLLOUTS,
+    stage_episode_rollouts,
+)
+
 DEFAULT_SPEED = 35.0  # current measured aggregate speed for the recurrent policy
 DEFAULT_NUM_ENVS = 4
 DEFAULT_N_STEPS = 2048
@@ -51,21 +57,6 @@ DEFAULT_CHECKPOINT_INTERVAL_TRANSITIONS = 122_880  # preserved project default; 
 PROGRESS_ROLLOUTS = 1
 TERMINAL_PROGRESS_ROLLOUTS = 2
 
-# Maximum episode length in per-environment PPO rollout lengths. All numbers
-# are multiples of POKEMON_AI_PPO_N_STEPS, so the per-env and vector rollout
-# arithmetic stays aligned even if the user changes PPO_N_STEPS.
-# These are heuristic exploration caps; actual success time is policy-dependent.
-STAGE_EPISODE_ROLLOUTS: dict[str, int] = {
-    "starter": 6,             # rescue Birch, win opening wild battle, return to lab
-    "leave_birch_lab": 15,    # finish lab dialogue and navigate onto Route 101
-    "reach_oldale": 20,       # traverse Route 101 and enter Oldale
-    "reach_route103": 24,     # navigate Oldale to Route 103
-    "defeat_rival": 32,       # find/engage rival and win first trainer battle
-    "return_birch_lab": 40,   # reverse the route and return to Littleroot
-    "pokedex": 8,             # trigger and finish the lab Pokédex dialogue
-    "first_badge": 64,        # much longer multi-map journey and Gym objective
-}
-DEFAULT_STAGE_EPISODE_ROLLOUTS = 24
 KEY_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
 SPEED_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*transitions/s\s+total", re.I)
 
@@ -227,10 +218,6 @@ def valid_batch_size(requested: int, rollout_size: int) -> int:
         if rollout_size % value == 0:
             return value
     return 1
-
-
-def stage_episode_rollouts(stage: str) -> int:
-    return STAGE_EPISODE_ROLLOUTS.get(stage, DEFAULT_STAGE_EPISODE_ROLLOUTS)
 
 
 def stage_start_state(

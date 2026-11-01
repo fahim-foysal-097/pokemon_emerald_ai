@@ -74,6 +74,16 @@ class RuntimeStateResolutionTests(unittest.TestCase):
         )
         self.assertEqual(resolved, expected)
 
+    def test_new_route101_stage_starts_from_the_littleroot_milestone(self):
+        expected = stage_start_state_path(self.root, "reach_route101", self.canonical)
+        self.assertEqual(expected, self.leave_lab_milestone.resolve())
+        resolved = resolve_runtime_start_state_path(
+            self.root, "reach_route101", mode="train",
+            canonical_start_state=self.canonical,
+            training_start_state=self.leave_lab_milestone,
+        )
+        self.assertEqual(resolved, expected)
+
     def test_later_stage_rejects_wrong_milestone_path(self):
         with self.assertRaisesRegex(ValueError, "must use its mapped start state"):
             resolve_runtime_start_state_path(

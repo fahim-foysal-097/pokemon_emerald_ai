@@ -17,7 +17,8 @@ class ConfigureTrainingTests(unittest.TestCase):
     def setUp(self):
         self.stages = [
             ct.StageInfo("starter", "starter", "Starter + opening battle"),
-            ct.StageInfo("leave_birch_lab", "leave Birch's Lab", "Exit lab"),
+            ct.StageInfo("leave_birch_lab", "exit Birch's Lab", "Enter Littleroot Town"),
+            ct.StageInfo("reach_route101", "reach Route 101", "Exit Littleroot Town"),
             ct.StageInfo("reach_oldale", "reach Oldale", "Travel"),
             ct.StageInfo("reach_route103", "reach Route 103", "Travel"),
             ct.StageInfo("defeat_rival", "defeat rival", "Battle"),
@@ -48,7 +49,9 @@ class ConfigureTrainingTests(unittest.TestCase):
         pokedex = self.build(stage="pokedex")
         badge = self.build(stage="first_badge")
         self.assertEqual(starter.max_episode_steps, 6 * 2048)
+        route101 = self.build(stage="reach_route101")
         self.assertEqual(lab.max_episode_steps, 15 * 2048)
+        self.assertEqual(route101.max_episode_steps, 20 * 2048)
         self.assertEqual(pokedex.max_episode_steps, 8 * 2048)
         self.assertEqual(badge.max_episode_steps, 64 * 2048)
         self.assertLess(starter.max_episode_steps, lab.max_episode_steps)
@@ -65,7 +68,7 @@ class ConfigureTrainingTests(unittest.TestCase):
         plan = self.build(stage="reach_oldale")
         values = ct.values_for_plan(plan)
         self.assertEqual(values["POKEMON_AI_OBJECTIVE"], "reach_oldale")
-        self.assertTrue(values["POKEMON_AI_TRAINING_START_STATE"].endswith("milestones/leave_birch_lab.state"))
+        self.assertTrue(values["POKEMON_AI_TRAINING_START_STATE"].endswith("milestones/reach_route101.state"))
         self.assertEqual(values["POKEMON_AI_MAX_EPISODE_STEPS"], str(20 * 2048))
         self.assertEqual(values["POKEMON_AI_RESUME"], "1")
         self.assertEqual(plan.total_transitions % plan.rollout_size, 0)
@@ -84,7 +87,8 @@ class ConfigureTrainingTests(unittest.TestCase):
         expected = {
             "starter": "runtime_data/states/training_start.state",
             "leave_birch_lab": "runtime_data/states/milestones/starter.state",
-            "reach_oldale": "runtime_data/states/milestones/leave_birch_lab.state",
+            "reach_route101": "runtime_data/states/milestones/leave_birch_lab.state",
+            "reach_oldale": "runtime_data/states/milestones/reach_route101.state",
             "reach_route103": "runtime_data/states/milestones/reach_oldale.state",
             "defeat_rival": "runtime_data/states/milestones/reach_route103.state",
             "return_birch_lab": "runtime_data/states/milestones/defeat_rival.state",

@@ -8,6 +8,7 @@ import unittest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MAIN_SOURCE = PROJECT_ROOT / "main.py"
+CURRICULUM_SOURCE = PROJECT_ROOT / "run_curriculum.py"
 
 
 def _method_source(tree: ast.AST, class_name: str, method_name: str) -> str:
@@ -83,6 +84,42 @@ class MainSourceGuardTests(unittest.TestCase):
         atomic_start = self.source.index("def atomic_save_model(")
         atomic_end = self.source.index("def archive_model_checkpoint(", atomic_start)
         self.assertIn("except BaseException", self.source[atomic_start:atomic_end])
+
+    def test_badge_flag_ids_are_defined_before_flag_snapshot_offsets(self):
+        badge_definition = self.source.index("BADGE_FLAG_IDS = tuple(range(0x867, 0x86F))")
+        byte_offsets = self.source.index("FLAG_BYTE_OFFSETS = tuple(")
+        self.assertLess(badge_definition, byte_offsets)
+
+    def test_flag_rewards_require_a_verified_episode_baseline(self):
+        step = _method_source(self.tree, "EmeraldEnv", "step")
+        self.assertIn("if state.get(\"flag_telemetry_valid\", False):", step)
+        self.assertIn("if not self._badge_baseline_verified:", step)
+        self.assertIn("if not self._story_flag_baseline_verified:", step)
+        self.assertIn("if not self._trainer_flag_baseline_verified:", step)
+        self.assertIn("self.seen_badge_flags |= observed_badge_flags", step)
+
+    def test_unstable_saveblock_pointer_cannot_award_map_or_tile_novelty(self):
+        step = _method_source(self.tree, "EmeraldEnv", "step")
+        self.assertIn('map_telemetry_valid = bool(state.get("saveblock_pointer_stable", False))', step)
+        reader = _method_source(self.tree, "EmeraldEnv", "_read_game_state")
+        self.assertIn('if not saveblock_pointer_stable:', reader)
+        self.assertIn('map_id = -1', reader)
+        self.assertIn('player_x = None', reader)
+        self.assertIn('player_y = None', reader)
+        self.assertIn('state["map_id"] = -1', step)
+
+    def test_game_state_uses_double_read_and_preserves_persistent_flag_history(self):
+        reader = _method_source(self.tree, "EmeraldEnv", "_read_game_state")
+        self.assertIn("flag_bytes_first", reader)
+        self.assertIn("flag_bytes_second", reader)
+        self.assertIn("pointer_after", reader)
+        self.assertIn("previous_story_flags | set(story_flags_raw)", reader)
+        self.assertIn("previous_trainer_flags | set(trainer_flags_first)", reader)
+
+    def test_archive_comparison_requires_objective_success_improvement(self):
+        curriculum_source = CURRICULUM_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("if score[0] <= baseline_success_rate or score[0] <= 0.0:", curriculum_source)
+        self.assertIn("if full_score[0] <= baseline_success_rate:", curriculum_source)
 
     def test_worker_reset_timing_is_reported_separately(self):
         reset = _method_source(self.tree, "EmeraldEnv", "reset")
