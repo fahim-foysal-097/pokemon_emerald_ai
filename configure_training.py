@@ -47,7 +47,7 @@ from curriculum_objectives import (
     stage_episode_rollouts,
 )
 
-DEFAULT_SPEED = 35.0  # current measured aggregate speed for the recurrent policy
+DEFAULT_SPEED = 100.0
 DEFAULT_NUM_ENVS = 4
 DEFAULT_N_STEPS = 2048
 DEFAULT_BATCH_SIZE = 256
@@ -369,10 +369,9 @@ def build_plan(
                 "and reloading the same stage start state between chunks."
             )
     else:
-        # The current curriculum controller has one global MAX_EPISODE_STEPS value.
-        # Choose the largest episode profile among stages still to run, so longer
-        # later objectives are not prematurely timed out. Single-stage mode lets
-        # the user use a shorter, stage-specific timeout.
+        # The plan summary and budget estimate use the largest remaining stage
+        # horizon. run_curriculum.py applies each stage's own horizon to its child
+        # training process, so short early objectives are not given the final-stage cap.
         remaining_rollout_caps = [stage_episode_rollouts(item.key) for item in remaining_stages]
         if episode_steps_override is not None:
             global_episode_steps = positive_int(str(episode_steps_override), "episode step override")
@@ -400,11 +399,6 @@ def build_plan(
                 "The curriculum allocation leaves some of the training budget unused to preserve equal, "
                 "rollout-aligned chunks across remaining stages."
             )
-        warnings.append(
-            "The current run_curriculum.py has one global episode timeout, so curriculum mode uses the "
-            "longest recommended timeout from the selected stage onward. Use stage mode for a "
-            "stage-specific timeout."
-        )
 
     episode_wall_seconds = episode_steps / (speed / effective_envs)
     return Plan(
@@ -458,6 +452,11 @@ def values_for_plan(plan: Plan) -> dict[str, str]:
         "POKEMON_AI_TERMINAL_PROGRESS_EVERY": str(TERMINAL_PROGRESS_ROLLOUTS * rollout),
     }
     values["POKEMON_AI_CURRICULUM_STAGE_ONLY"] = "1" if plan.mode == "stage-only" else "0"
+    # Always manage this key so a prior stage-only override cannot leak into a
+    # later full-curriculum configuration and flatten every stage's own horizon.
+    values["POKEMON_AI_CURRICULUM_TRAIN_MAX_EPISODE_STEPS"] = (
+        str(plan.max_episode_steps) if plan.mode == "stage-only" else ""
+    )
     if plan.mode in {"curriculum", "stage-only"} or plan.profile == "fast_train":
         values["POKEMON_AI_NUM_ENVS"] = str(plan.envs)
     if plan.mode in {"curriculum", "stage-only"}:

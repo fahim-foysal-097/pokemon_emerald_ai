@@ -34,7 +34,8 @@ from typing import Any
 from important_logging import filter_persistent_log_text, is_important_log_line, should_flush_important_log, is_exception_end
 from curriculum_objectives import (
     CURRICULUM_PLAN_ID, OBJECTIVE_LABELS, OBJECTIVES_REQUIRING_FLAG_TELEMETRY, STAGES,
-    objective_start_error, stage_start_state_path, stage_episode_rollouts,
+    evaluation_gate_unreachable, objective_satisfied, objective_start_error, stage_start_state_path,
+    stage_episode_rollouts,
 )
 
 
@@ -83,6 +84,8 @@ def report_shell_config_overrides(values: dict[str, str]) -> None:
         "POKEMON_AI_OBJECTIVE",
         "POKEMON_AI_CURRICULUM_STAGE_ONLY",
         "POKEMON_AI_CANONICAL_START_STATE",
+        "POKEMON_AI_CURRICULUM_MAX_CHUNKS_PER_STAGE",
+        "POKEMON_AI_CURRICULUM_EVAL_DETERMINISTIC",
     )
     for key in keys:
         shell_value = os.environ.get(key)
@@ -149,6 +152,16 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
             pass
 
 
+def milestone_manifest_satisfies_objective(stage: str, manifest: dict[str, Any]) -> bool:
+    """Require the persisted decoded state itself to prove its named objective."""
+    if not isinstance(manifest, dict) or manifest.get("objective") != stage:
+        return False
+    state_metrics = manifest.get("state")
+    if not isinstance(state_metrics, dict):
+        return False
+    return objective_satisfied(stage, state_metrics)
+
+
 def milestone_matches_evaluation(
     manifest: dict[str, Any],
     report: dict[str, Any],
@@ -211,7 +224,11 @@ def report_score(report: dict[str, Any]) -> tuple[float, float, float, float]:
             return fallback
         return number
 
-    success_rate = max(0.0, min(1.0, finite(report.get("success_rate"), 0.0)))
+    # Partial, gate-unreachable reports must not look artificially strong merely
+    # because their observed denominator is small (e.g. 1 success in 2 attempts).
+    success_rate = max(0.0, min(1.0, finite(
+        report.get("success_rate_over_requested", report.get("success_rate")), 0.0
+    )))
     episodes = report.get("episodes", [])
     if isinstance(episodes, list) and episodes:
         progress = sum(
@@ -226,34 +243,120 @@ def report_score(report: dict[str, Any]) -> tuple[float, float, float, float]:
 
 
 RESUMABLE_CURRICULUM_STATUSES = frozenset({
-    "running", "interrupted", "stage_not_mastered",
+    "running", "in_progress", "interrupted", "stalled", "ready", "stage_not_mastered",
     "stage_only_training", "stage_only_budget_complete",
 })
 
 def resolve_saved_curriculum_stage(saved_state: dict[str, Any]) -> tuple[str | None, str]:
-    """Resolve a resumable stage, including the safe v4 -> v5 early-stage migration.
+    """Resolve a resumable stage with strict version-aware migration.
 
-    In v4, `leave_birch_lab` meant reaching Route 101, but the supplied runs actually
-    reached Littleroot Town and were scored as failures. In v5 that existing stage is
-    narrowed to the first verified map transition (Birch's Lab -> Littleroot). Its
-    predecessor is still the exact same `starter.state` milestone, so it is safe to
-    resume without repeating the already-completed starter stage. The new
-    `reach_route101` stage then consumes the freshly produced `leave_birch_lab.state`.
-    Later v4 stages are not migrated because their predecessor chain changed.
+    v5 and v6 retain the same 58-stage order and predecessor chain. A v5 stage is
+    eligible for migration, but its previous milestone is still revalidated using
+    the corrected v6 event predicates before the stage may launch. The earlier v4
+    migration is limited to the two stages whose semantics and predecessor state
+    were unchanged when Route 101 was split into its own stage.
     """
     if not isinstance(saved_state, dict):
         return None, "unreadable"
-    if saved_state.get("status") not in RESUMABLE_CURRICULUM_STATUSES:
-        return None, "not_resumable"
+    status = str(saved_state.get("status", "")).strip().lower()
     stage = saved_state.get("stage")
+    plan = saved_state.get("curriculum_plan")
+    if status == "complete":
+        if plan != CURRICULUM_PLAN_ID or stage != STAGES[-1]:
+            return None, "incompatible_plan"
+        return None, "complete"
+    if status == "mastered":
+        if stage not in STAGES:
+            return None, "unknown_stage"
+        if plan != CURRICULUM_PLAN_ID:
+            return None, "incompatible_plan"
+        next_index = STAGES.index(stage) + 1
+        if next_index >= len(STAGES):
+            return None, "complete"
+        return STAGES[next_index], "after_mastered"
+    if status not in RESUMABLE_CURRICULUM_STATUSES:
+        return None, "not_resumable"
     if stage not in STAGES:
         return None, "unknown_stage"
-    plan = saved_state.get("curriculum_plan")
     if plan == CURRICULUM_PLAN_ID:
         return stage, "current"
+    if plan == "emerald_intro_v5":
+        # v6 preserves the exact 58-stage order and start-state chain. Every
+        # predecessor is still revalidated against the corrected v6 predicates
+        # before it is used, so only genuinely valid old milestones survive.
+        return stage, "migrated_v5_revalidated"
     if plan == "emerald_intro_v4" and stage in {"starter", "leave_birch_lab"}:
         return stage, "migrated_v4_early_stage"
     return None, "incompatible_plan"
+
+
+def stage_training_episode_step_limit(stage: str, n_steps: int, override: int | None = None) -> int:
+    """Return the per-environment training episode cap for one curriculum stage."""
+    if int(n_steps) < 1:
+        raise ValueError("POKEMON_AI_PPO_N_STEPS must be positive")
+    if override is None:
+        return stage_episode_rollouts(stage) * int(n_steps)
+    if int(override) < 1:
+        raise ValueError("Training episode-step override must be positive")
+    # Keep the episode horizon aligned to per-environment PPO rollout lengths.
+    return math.ceil(int(override) / int(n_steps)) * int(n_steps)
+
+
+def align_training_chunk_steps(base_steps: int, n_steps: int, num_envs: int) -> int:
+    """Round a requested transition budget up to a complete vector PPO rollout."""
+    if min(int(base_steps), int(n_steps), int(num_envs)) < 1:
+        raise ValueError("Training chunk size, PPO n_steps, and environment count must be positive")
+    vector_rollout = int(n_steps) * int(num_envs)
+    return math.ceil(int(base_steps) / vector_rollout) * vector_rollout
+
+
+def stage_training_chunk_steps(
+    stage: str,
+    base_steps: int,
+    n_steps: int,
+    num_envs: int = 4,
+    episode_step_override: int | None = None,
+) -> int:
+    """Size a curriculum chunk for at least one capped episode in every worker."""
+    if int(base_steps) < 1:
+        raise ValueError("Training chunk size must be positive")
+    episode_limit = stage_training_episode_step_limit(stage, n_steps, episode_step_override)
+    minimum_episode_budget = episode_limit * int(num_envs)
+    return align_training_chunk_steps(max(int(base_steps), minimum_episode_budget), n_steps, num_envs)
+
+
+def build_training_environment(
+    base_env: dict[str, str],
+    *,
+    stage: str,
+    start_state: Path,
+    total_timesteps: int,
+    max_episode_steps: int,
+    stage_only: bool = False,
+    reset_entropy_for_stage: bool = False,
+) -> dict[str, str]:
+    """Build a stage-isolated training child environment with the correct episode cap."""
+    if int(total_timesteps) < 1 or int(max_episode_steps) < 1:
+        raise ValueError("Training transition and episode-step limits must be positive")
+    env = base_env.copy()
+    env.update({
+        "POKEMON_AI_PROFILE": "fast_train",
+        "POKEMON_AI_MODE": "train",
+        "POKEMON_AI_GUI_MODE": "0",
+        "POKEMON_AI_RECORD_VIDEO": "0",
+        "POKEMON_AI_AUTO_START_TENSORBOARD": "0",
+        "POKEMON_AI_OBJECTIVE": stage,
+        "POKEMON_AI_TRAINING_START_STATE": str(start_state),
+        "POKEMON_AI_TOTAL_TIMESTEPS": str(int(total_timesteps)),
+        # The .env value is a standalone/single-stage setting; the curriculum must
+        # override it for every objective as it advances through the stage list.
+        "POKEMON_AI_MAX_EPISODE_STEPS": str(int(max_episode_steps)),
+        "POKEMON_AI_CURRICULUM_STAGE_ONLY": "1" if stage_only else "0",
+        # Reset exploration at the first chunk of a new stage, then resume it from
+        # checkpoint state on any subsequent chunk for that same stage.
+        "POKEMON_AI_ENTROPY_RESET_FOR_STAGE": "1" if reset_entropy_for_stage else "0",
+    })
+    return env
 
 
 def stage_evaluation_step_limit(stage: str, n_steps: int, override: int | None = None) -> int:
@@ -270,11 +373,14 @@ def stage_evaluation_step_limit(stage: str, n_steps: int, override: int | None =
 def build_evaluation_environment(
     base_env: dict[str, str], *, stage: str, start_state: Path, requested_episodes: int,
     deterministic: bool, eval_seed: str, max_episode_steps: int, no_progress_steps: int = 4096,
-    checkpoint_path: Path | None = None,
+    checkpoint_path: Path | None = None, stop_if_gate_unreachable: bool = False,
+    success_threshold: float = 0.9,
 ) -> dict[str, str]:
     """Build an isolated, exact evaluation subprocess configuration."""
     if requested_episodes < 1 or max_episode_steps < 1 or no_progress_steps < 128:
         raise ValueError("Evaluation episode count/step limit must be positive and no-progress guard >= 128")
+    if not math.isfinite(float(success_threshold)) or not 0.0 < float(success_threshold) <= 1.0:
+        raise ValueError("Evaluation success threshold must be in (0, 1]")
     env = base_env.copy()
     env.update({
         "POKEMON_AI_PROFILE": "evaluate",
@@ -290,11 +396,115 @@ def build_evaluation_environment(
         "POKEMON_AI_EVAL_MAX_EPISODE_STEPS": str(int(max_episode_steps)),
         "POKEMON_AI_EVAL_NO_PROGRESS_STEPS": str(int(no_progress_steps)),
         "POKEMON_AI_EVAL_SEED": str(eval_seed),
+        "POKEMON_AI_EVAL_STOP_IF_GATE_UNREACHABLE": "1" if stop_if_gate_unreachable else "0",
+        "POKEMON_AI_EVAL_SUCCESS_THRESHOLD": str(float(success_threshold)),
     })
     env.pop("POKEMON_AI_EVAL_CHECKPOINT", None)
     if checkpoint_path is not None:
         env["POKEMON_AI_EVAL_CHECKPOINT"] = str(checkpoint_path)
     return env
+
+
+def validate_evaluation_report_progress(
+    report: dict[str, Any], requested_episodes: int, threshold: float,
+) -> tuple[int, int, float]:
+    """Validate full or mathematically-futile early-stopped evaluation reports."""
+    if requested_episodes < 1 or not math.isfinite(float(threshold)) or not 0.0 < threshold <= 1.0:
+        raise ValueError("Requested episodes and evaluation threshold must be valid")
+    try:
+        reported_requested = int(report.get("episodes_requested", 0))
+        completed = int(report.get("episodes_completed", 0))
+        successes = int(report.get("successes", -1))
+        success_rate = float(report.get("success_rate", float("nan")))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("Evaluation report has invalid episode statistics") from exc
+    if reported_requested != requested_episodes:
+        raise RuntimeError(
+            f"Evaluation report requested {reported_requested} episodes; controller requested {requested_episodes}."
+        )
+    if completed < 1 or completed > requested_episodes:
+        raise RuntimeError(
+            f"Evaluation report completed {completed} episodes; expected between 1 and {requested_episodes}."
+        )
+    if not 0 <= successes <= completed or not math.isfinite(success_rate):
+        raise RuntimeError("Evaluation report has out-of-range success statistics")
+    expected_rate = successes / completed
+    if not math.isclose(success_rate, expected_rate, rel_tol=0.0, abs_tol=1e-9):
+        raise RuntimeError("Evaluation report success_rate disagrees with successes/episodes_completed")
+    episodes = report.get("episodes")
+    if (
+        not isinstance(episodes, list)
+        or len(episodes) != completed
+        or any(not isinstance(item, dict) or not isinstance(item.get("success"), bool) for item in episodes)
+    ):
+        raise RuntimeError("Evaluation report episode details do not match episodes_completed")
+    episode_successes = sum(1 for item in episodes if item["success"] is True)
+    if episode_successes != successes:
+        raise RuntimeError("Evaluation report successes disagrees with per-episode success details")
+
+    stopped_early = bool(report.get("evaluation_stopped_early", False))
+    stop_reason = report.get("evaluation_stop_reason")
+    remaining = requested_episodes - completed
+    reported_threshold = report.get("evaluation_gate_threshold")
+    if reported_threshold is not None:
+        try:
+            parsed_threshold = float(reported_threshold)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("Evaluation report has an invalid success-gate threshold") from exc
+        if not math.isfinite(parsed_threshold) or not math.isclose(
+            parsed_threshold, threshold, rel_tol=0.0, abs_tol=1e-9
+        ):
+            raise RuntimeError("Evaluation report success-gate threshold does not match the controller")
+
+    if remaining:
+        if not stopped_early or stop_reason != "gate_unreachable":
+            raise RuntimeError("Evaluation report is incomplete without a validated gate-unreachable stop")
+        if not evaluation_gate_unreachable(successes, completed, requested_episodes, threshold):
+            raise RuntimeError(
+                "Evaluation stopped early even though the configured success threshold remained reachable"
+            )
+        if reported_threshold is None:
+            raise RuntimeError("Early-stopped evaluation report is missing its success-gate threshold")
+    elif stopped_early:
+        raise RuntimeError("Evaluation report claims an early stop despite completing every requested episode")
+    elif stop_reason not in (None, ""):
+        raise RuntimeError("Completed evaluation report has an unexpected early-stop reason")
+
+    reported_requested_rate = report.get("success_rate_over_requested")
+    if reported_requested_rate is not None:
+        try:
+            requested_rate = float(reported_requested_rate)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("Evaluation report has an invalid success_rate_over_requested") from exc
+        expected_requested_rate = successes / requested_episodes
+        if not math.isfinite(requested_rate) or not math.isclose(
+            requested_rate, expected_requested_rate, rel_tol=0.0, abs_tol=1e-9
+        ):
+            raise RuntimeError("Evaluation report success_rate_over_requested is inconsistent")
+
+    reported_upper_bound = report.get("success_rate_upper_bound")
+    expected_upper_bound = (successes + remaining) / requested_episodes
+    if reported_upper_bound is not None:
+        try:
+            upper_bound = float(reported_upper_bound)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("Evaluation report has an invalid success_rate_upper_bound") from exc
+        if not math.isfinite(upper_bound) or not math.isclose(
+            upper_bound, expected_upper_bound, rel_tol=0.0, abs_tol=1e-9
+        ):
+            raise RuntimeError("Evaluation report success_rate_upper_bound is inconsistent")
+    return completed, successes, success_rate
+
+
+def evaluation_meets_gate(report: dict[str, Any], threshold: float) -> bool:
+    """Only a complete evaluation can satisfy a curriculum promotion gate."""
+    try:
+        requested = int(report.get("episodes_requested", 0))
+        completed = int(report.get("episodes_completed", 0))
+        rate = float(report.get("success_rate", float("nan")))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return requested > 0 and completed == requested and math.isfinite(rate) and rate >= threshold
 
 
 def file_sha1(path: Path) -> str:
@@ -535,8 +745,10 @@ def stream_command(command: list[str], env: dict[str, str], cwd: Path, log_path:
             graceful_timeout = _shutdown_timeout(env, "POKEMON_AI_SHUTDOWN_TIMEOUT", 900.0)
             terminate_timeout = _shutdown_timeout(env, "POKEMON_AI_SHUTDOWN_TERMINATE_TIMEOUT", 60.0)
             print(
-                "\n[Curriculum] Stop requested. main.py will finish its current PPO rollout/update, "
-                f"save, and close workers (graceful window: {graceful_timeout:.0f}s).",
+                "\n[Curriculum] Stop requested. main.py will reach its safe shutdown boundary "
+                "and close its emulator workers; during training it finishes the current full "
+                "PPO rollout/update and checkpoints before exiting "
+                f"(graceful window: {graceful_timeout:.0f}s).",
                 flush=True,
             )
             stop_managed_process(
@@ -671,6 +883,24 @@ def validate_stage_start_state(
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Cannot read prerequisite milestone metadata {manifest_path}: {exc}") from exc
 
+    manifest_plan = manifest.get("curriculum_plan")
+    # Older manifests may be reused only when their stage semantics are known to
+    # be compatible. Every accepted legacy state is then re-evaluated using the
+    # current corrected objective predicate below; the version label alone never
+    # grants promotion or stage completion.
+    compatible_legacy_manifest = (
+        manifest_plan == "emerald_intro_v5"
+        or (manifest_plan == "emerald_intro_v4" and prior_stage == "starter")
+    )
+    if (
+        manifest_plan is not None
+        and manifest_plan != CURRICULUM_PLAN_ID
+        and not compatible_legacy_manifest
+    ):
+        raise RuntimeError(
+            f"Prerequisite metadata {manifest_path} belongs to curriculum plan {manifest_plan!r}, "
+            f"not a compatible {CURRICULUM_PLAN_ID!r} predecessor. Recreate the preceding milestone."
+        )
     if manifest.get("objective") != prior_stage:
         raise RuntimeError(
             f"Prerequisite metadata {manifest_path} belongs to {manifest.get('objective')!r}, "
@@ -716,6 +946,12 @@ def validate_stage_start_state(
         raise RuntimeError(
             f"Prerequisite metadata {manifest_path} records unstable event/badge flags required by {stage}; "
             "recreate the milestone from a verified game state."
+        )
+    if not objective_satisfied(prior_stage, state_metrics):
+        raise RuntimeError(
+            f"The {prior_stage} prerequisite manifest does not satisfy its own curriculum objective; "
+            "the saved milestone may be stale, incomplete, or based on incorrect telemetry. "
+            "Recreate/verify the preceding milestone before continuing."
         )
     prerequisite_error = objective_start_error(stage, state_metrics)
     if prerequisite_error:
@@ -844,6 +1080,35 @@ def copy_checkpoint_before_training(root: Path, model_name: str) -> Path | None:
     return destination
 
 
+def archive_mastered_checkpoint(root: Path, model_name: str, stage: str) -> Path:
+    """Atomically save a ZIP-validated, stage-named snapshot of the mastered model."""
+    source = root / f"{model_name}.zip"
+    if not source.is_file() or not zipfile.is_zipfile(source):
+        raise RuntimeError(f"Cannot archive mastered stage {stage}: model checkpoint is missing or invalid: {source}")
+    with zipfile.ZipFile(source, "r") as archive:
+        bad_member = archive.testzip()
+    if bad_member is not None:
+        raise RuntimeError(f"Cannot archive mastered stage {stage}: corrupt model member {bad_member!r}")
+    destination_dir = root / "runtime_data" / "checkpoints"
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / f"{model_name}_{stage}_mastered.zip"
+    temporary = destination.with_suffix(destination.suffix + f".tmp.{os.getpid()}")
+    try:
+        shutil.copy2(source, temporary)
+        if file_sha1(source) != file_sha1(temporary) or not zipfile.is_zipfile(temporary):
+            raise RuntimeError(f"Mastered checkpoint copy failed ZIP/hash validation: {temporary}")
+        with zipfile.ZipFile(temporary, "r") as archive:
+            if archive.testzip() is not None:
+                raise RuntimeError(f"Mastered checkpoint copy is corrupt: {temporary}")
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        _fsync_dir(destination_dir)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
 def newest_report(log_dir: Path, before: set[Path]) -> Path | None:
     new_paths = set(log_dir.glob("evaluation_*.json")) - before
     candidates = [p for p in new_paths if p.is_file()]
@@ -932,9 +1197,18 @@ def main() -> int:
             stream.flush()  # stage transitions/evaluation results are intentionally rare
 
     chunk_steps = int_setting(cfg, "POKEMON_AI_CURRICULUM_CHUNK_TIMESTEPS", 250_000)
-    max_chunks = int_setting(cfg, "POKEMON_AI_CURRICULUM_MAX_CHUNKS_PER_STAGE", 8)
+    max_chunks = int_setting(cfg, "POKEMON_AI_CURRICULUM_MAX_CHUNKS_PER_STAGE", 8, minimum=0)
     eval_episodes = int_setting(cfg, "POKEMON_AI_CURRICULUM_EVAL_EPISODES", 5)
     ppo_n_steps = int_setting(cfg, "POKEMON_AI_PPO_N_STEPS", 2048)
+    num_envs = int_setting(cfg, "POKEMON_AI_NUM_ENVS", 4)
+    train_episode_override_raw = os.environ.get(
+        "POKEMON_AI_CURRICULUM_TRAIN_MAX_EPISODE_STEPS",
+        cfg.get("POKEMON_AI_CURRICULUM_TRAIN_MAX_EPISODE_STEPS", ""),
+    ).strip()
+    train_episode_override = int_setting(
+        {"POKEMON_AI_CURRICULUM_TRAIN_MAX_EPISODE_STEPS": train_episode_override_raw},
+        "POKEMON_AI_CURRICULUM_TRAIN_MAX_EPISODE_STEPS", 1,
+    ) if train_episode_override_raw else None
     eval_step_override_raw = os.environ.get(
         "POKEMON_AI_CURRICULUM_EVAL_MAX_EPISODE_STEPS",
         cfg.get("POKEMON_AI_CURRICULUM_EVAL_MAX_EPISODE_STEPS", ""),
@@ -944,14 +1218,17 @@ def main() -> int:
         "POKEMON_AI_CURRICULUM_EVAL_MAX_EPISODE_STEPS", 1,
     ) if eval_step_override_raw else None
     eval_no_progress_steps = int_setting(cfg, "POKEMON_AI_EVAL_NO_PROGRESS_STEPS", 4096, minimum=128)
-    threshold = float_setting(cfg, "POKEMON_AI_CURRICULUM_SUCCESS_RATE", 0.8)
+    threshold = float_setting(cfg, "POKEMON_AI_CURRICULUM_SUCCESS_RATE", 0.9)
     deterministic = bool_setting(cfg, "POKEMON_AI_CURRICULUM_EVAL_DETERMINISTIC", True)
     compare_checkpoints = int_setting(cfg, "POKEMON_AI_CURRICULUM_COMPARE_CHECKPOINTS", 2, minimum=0)
-    if threshold <= 0:
-        raise SystemExit("POKEMON_AI_CURRICULUM_SUCCESS_RATE must be greater than zero.")
+    if not math.isfinite(threshold) or not 0.0 < threshold <= 1.0:
+        raise SystemExit("POKEMON_AI_CURRICULUM_SUCCESS_RATE must be greater than 0 and at most 1.")
+    if eval_episodes < 1:
+        raise SystemExit("POKEMON_AI_CURRICULUM_EVAL_EPISODES must be at least 1.")
 
     current_stage = args.start_stage
-    configured_objective = os.environ.get("POKEMON_AI_OBJECTIVE", cfg.get("POKEMON_AI_OBJECTIVE", "starter")).strip()
+    resume_resolution: str | None = None
+    configured_objective = os.environ.get("POKEMON_AI_OBJECTIVE", cfg.get("POKEMON_AI_OBJECTIVE", "starter")).strip().lower()
     if stage_only and current_stage is None:
         # In stage-only mode the explicitly configured objective must win over any
         # prior curriculum-state file; the user is asking for that one stage only.
@@ -965,6 +1242,7 @@ def main() -> int:
         try:
             saved_state = json.loads(run_state_path.read_text(encoding="utf-8"))
             resolved_stage, resolution = resolve_saved_curriculum_stage(saved_state)
+            resume_resolution = resolution
             if resolved_stage is not None:
                 current_stage = resolved_stage
                 if resolution == "migrated_v4_early_stage":
@@ -974,6 +1252,14 @@ def main() -> int:
                         "ends at Littleroot Town, and Route 101 is a separate next stage.",
                         flush=True,
                     )
+                elif resolution == "migrated_v5_revalidated":
+                    print(
+                        f"[Curriculum] Migrating saved v5 stage {current_stage!r} to v6. "
+                        "Its preceding milestone will be checked against corrected event flags before use.",
+                        flush=True,
+                    )
+                elif resolution == "after_mastered":
+                    print(f"[Curriculum] Previous stage was mastered; resuming at its successor {current_stage!r}.", flush=True)
                 elif stage_only:
                     print(f"[Curriculum] Stage-only mode selected saved stage {current_stage!r}; evaluations/promotions are disabled.", flush=True)
                 else:
@@ -986,8 +1272,17 @@ def main() -> int:
                 )
         except (OSError, json.JSONDecodeError, AttributeError):
             print("[Curriculum Warning] Prior curriculum state is unreadable; starting from the first stage.", flush=True)
+    if current_stage is None and resume_resolution == "complete" and args.start_stage is None:
+        print("[Curriculum] All 58 stages are already marked complete. Use --start-stage to intentionally replay a stage.", flush=True)
+        return 0
     if current_stage is None:
-        current_stage = "starter"
+        if configured_objective not in STAGES:
+            raise SystemExit(
+                f"POKEMON_AI_OBJECTIVE={configured_objective!r} is not a known stage. "
+                f"Choose one of: {', '.join(STAGES)}"
+            )
+        current_stage = configured_objective
+        print(f"[Curriculum] No resumable state found; using configured POKEMON_AI_OBJECTIVE={current_stage!r}.", flush=True)
     start_index = STAGES.index(current_stage)
 
     checkpoint = root / f"{model_name}.zip"
@@ -1020,7 +1315,8 @@ def main() -> int:
     else:
         print(f" Evaluation gate    : {'deterministic' if deterministic else 'stochastic'}; "
               f"{eval_episodes} episodes; success rate >= {threshold:.0%}", flush=True)
-    print(f" Train chunk        : {chunk_steps:,} transitions; maximum {max_chunks} chunks for this invocation/stage", flush=True)
+    print(f" Train chunk        : base {chunk_steps:,} transitions; maximum {'unlimited' if max_chunks == 0 else max_chunks} chunks per stage", flush=True)
+    print(" Training episode   : stage-specific action cap (or explicit POKEMON_AI_CURRICULUM_TRAIN_MAX_EPISODE_STEPS override)", flush=True)
     print(f" Evaluation guard   : stage-specific action cap; stop after {eval_no_progress_steps:,} actions without meaningful game progress", flush=True)
     if not stage_only:
         print(f" Checkpoint recovery: compare up to {compare_checkpoints} recent distinct archived models when the current model misses the gate", flush=True)
@@ -1032,15 +1328,23 @@ def main() -> int:
         if stage_only:
             stage = current_stage
             stage_start = stage_start_state_path(root, stage, initial_state)
+            stage_chunk_steps = align_training_chunk_steps(chunk_steps, ppo_n_steps, num_envs)
+            stage_train_limit = stage_training_episode_step_limit(stage, ppo_n_steps, train_episode_override)
             print(f"\n[Dry-run] STAGE-ONLY: {stage} — {OBJECTIVE_LABELS[stage]}", flush=True)
             print(f"  Start state       : {stage_start}", flush=True)
-            print(f"  Training chunks   : {max_chunks} × {chunk_steps:,} = {max_chunks * chunk_steps:,} transitions", flush=True)
+            total = "unlimited" if max_chunks == 0 else f"{max_chunks * stage_chunk_steps:,}"
+            print(f"  Training episode  : max {stage_train_limit:,} decisions per environment", flush=True)
+            print(f"  Training chunks   : {'unlimited' if max_chunks == 0 else max_chunks} × {stage_chunk_steps:,} = {total} transitions", flush=True)
             print("  Evaluation        : DISABLED", flush=True)
             print("  Checkpoint compare: DISABLED", flush=True)
             print("  Promotion         : DISABLED; controller exits after this stage", flush=True)
             print("\n[Dry-run] Stage-only plan preview complete (exit 0).", flush=True)
             return 0
         for stage in STAGES[start_index:]:
+            stage_chunk_steps = stage_training_chunk_steps(
+                stage, chunk_steps, ppo_n_steps, num_envs, train_episode_override
+            )
+            stage_train_limit = stage_training_episode_step_limit(stage, ppo_n_steps, train_episode_override)
             stage_start = stage_start_state_path(root, stage, initial_state)
             print(f"\n[Dry-run] Stage {stage}: start state={stage_start}", flush=True)
             if checkpoint.is_file():
@@ -1052,7 +1356,7 @@ def main() -> int:
                 print("  1. No checkpoint yet; start a fresh model from the canonical pre-starter state.", flush=True)
             else:
                 print("  1. No checkpoint yet; the real run must begin at starter before it can promote to this stage.", flush=True)
-            print(f"  3. If not mastered, train up to {max_chunks} chunk(s) of {chunk_steps:,} transitions each; evaluate after each chunk.", flush=True)
+            print(f"  3. If not mastered, train with a {stage_train_limit:,}-decision per-env episode cap; use {'unlimited' if max_chunks == 0 else f'up to {max_chunks}'} chunk(s) of {stage_chunk_steps:,} transitions each; evaluate after each chunk.", flush=True)
             print(f"  4. Promote only after success_rate >= {threshold:.0%} and a fresh {stage}.state + matching manifest are created.", flush=True)
         print("\n[Dry-run] Plan preview complete (exit 0).", flush=True)
         return 0
@@ -1110,6 +1414,8 @@ def main() -> int:
             max_episode_steps=stage_eval_limit,
             no_progress_steps=eval_no_progress_steps,
             checkpoint_path=checkpoint_path,
+            stop_if_gate_unreachable=True,
+            success_threshold=threshold,
         )
         command = [str(python), "main.py"]
         stream_command(command, env, root, run_log_path, args.dry_run)
@@ -1121,16 +1427,17 @@ def main() -> int:
         report = json.loads(report_path.read_text(encoding="utf-8"))
         if report.get("objective") != stage or report.get("mode") != ("deterministic" if deterministic else "stochastic"):
             raise RuntimeError(f"Evaluation report does not match the requested stage/mode: {report_path}")
-        if int(report.get("episodes_requested", 0)) != requested_episodes:
-            raise RuntimeError(
-                f"Evaluation report requested {report.get('episodes_requested')} episodes; "
-                f"controller requested {requested_episodes}. Refusing to promote."
+        try:
+            completed_episodes, successes, success_rate = validate_evaluation_report_progress(
+                report, requested_episodes, threshold
             )
-        if int(report.get("episodes_completed", 0)) != requested_episodes:
-            raise RuntimeError(
-                f"Evaluation report contains {report.get('episodes_completed')} completed episodes; "
-                f"expected {requested_episodes}. Refusing to promote."
-            )
+        except (RuntimeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid evaluation episode results in {report_path}: {exc}") from exc
+        if str(report.get("rom_sha1_expected", "")).strip().lower() != expected_rom_hash:
+            raise RuntimeError(f"Evaluation report ROM identity does not match the configured ROM: {report_path}")
+        reported_start_state = report.get("start_state")
+        if not isinstance(reported_start_state, str) or Path(reported_start_state).resolve() != start_state.resolve():
+            raise RuntimeError(f"Evaluation report start state does not match the requested milestone: {report_path}")
         wanted_checkpoint = (checkpoint_path or checkpoint).resolve()
         reported_checkpoint = report.get("checkpoint")
         if not isinstance(reported_checkpoint, str) or Path(reported_checkpoint).resolve() != wanted_checkpoint:
@@ -1148,8 +1455,9 @@ def main() -> int:
             )
         report["_controller_evaluation_started_unix"] = evaluation_started_unix
         evaluation_summary = (
-            f"[Curriculum Evaluation] stage={stage} successes={report.get('successes')}/"
-            f"{requested_episodes} rate={float(report.get('success_rate', 0.0)):.1%} "
+            f"[Curriculum Evaluation] stage={stage} successes={successes}/{completed_episodes} "
+            f"(requested={requested_episodes}) observed_rate={success_rate:.1%} "
+            f"max_possible_rate={float(report.get('success_rate_upper_bound', success_rate)):.1%} "
             f"mean_steps={float(report.get('mean_steps', 0.0)):.0f} report={report_path}"
         )
         print(evaluation_summary, flush=True)
@@ -1167,7 +1475,12 @@ def main() -> int:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return False
-        if manifest.get("objective") != stage or manifest.get("rom_sha1_expected") != expected_rom_hash:
+        if (
+            manifest.get("objective") != stage
+            or manifest.get("curriculum_plan") != CURRICULUM_PLAN_ID
+            or manifest.get("rom_sha1_expected") != expected_rom_hash
+            or not milestone_manifest_satisfies_objective(stage, manifest)
+        ):
             return False
         started_unix = report.get("_controller_evaluation_started_unix")
         if not isinstance(started_unix, (int, float)):
@@ -1266,32 +1579,39 @@ def main() -> int:
             stage_start_state = stage_start_state_path(root, stage, initial_state)
             validate_stage_start_state(root, stage, stage_start_state, expected_rom_hash)
 
+            stage_chunk_steps = align_training_chunk_steps(chunk_steps, ppo_n_steps, num_envs)
+            stage_train_limit = stage_training_episode_step_limit(stage, ppo_n_steps, train_episode_override)
             stage_message = (
                 f"[Stage-only] TRAINING {stage.upper()}: {OBJECTIVE_LABELS[stage]} | "
-                f"start={stage_start_state} | evaluation/promotions disabled"
+                f"start={stage_start_state} | episode_cap={stage_train_limit:,} decisions/env | "
+                f"evaluation/promotions disabled"
             )
             print(f"\n{stage_message}", flush=True)
             append_curriculum_event(stage_message)
-            for chunk_index in range(1, max_chunks + 1):
+            chunk_index = 0
+            while max_chunks == 0 or chunk_index < max_chunks:
+                chunk_index += 1
                 chunk_message = (
-                    f"[Stage-only] stage={stage} chunk={chunk_index}/{max_chunks} "
-                    f"transitions={chunk_steps:,}; no evaluation or promotion"
+                    f"[Stage-only] stage={stage} chunk={chunk_index}/{'unlimited' if max_chunks == 0 else max_chunks} "
+                    f"transitions={stage_chunk_steps:,}; no evaluation or promotion"
                 )
                 print(f"\n{chunk_message}", flush=True)
                 append_curriculum_event(chunk_message)
-                train_env = base_env.copy()
-                train_env["POKEMON_AI_PROFILE"] = "fast_train"
-                train_env["POKEMON_AI_MODE"] = "train"
-                train_env["POKEMON_AI_GUI_MODE"] = "0"
-                train_env["POKEMON_AI_RECORD_VIDEO"] = "0"
-                train_env["POKEMON_AI_AUTO_START_TENSORBOARD"] = "0"
-                train_env["POKEMON_AI_CURRICULUM_STAGE_ONLY"] = "0"
+                stage_train_limit = stage_training_episode_step_limit(
+                    stage, ppo_n_steps, train_episode_override
+                )
+                train_env = build_training_environment(
+                    base_env,
+                    stage=stage,
+                    start_state=stage_start_state,
+                    total_timesteps=stage_chunk_steps,
+                    max_episode_steps=stage_train_limit,
+                    stage_only=False,
+                    reset_entropy_for_stage=(chunk_index == 1),
+                )
                 # Do not create an unverified stage milestone during un-gated training.
                 # A normal curriculum evaluation can later verify and publish it.
                 train_env["POKEMON_AI_MILESTONE_SAVE"] = "0"
-                train_env["POKEMON_AI_OBJECTIVE"] = stage
-                train_env["POKEMON_AI_TRAINING_START_STATE"] = str(stage_start_state)
-                train_env["POKEMON_AI_TOTAL_TIMESTEPS"] = str(chunk_steps)
                 stream_command([str(python), "main.py"], train_env, root, run_log_path, args.dry_run)
                 atomic_json(run_state_path, {
                     "schema_version": 2,
@@ -1300,7 +1620,7 @@ def main() -> int:
                     "stage": stage,
                     "chunk_index": chunk_index,
                     "chunks_total": max_chunks,
-                    "chunk_timesteps": chunk_steps,
+                    "chunk_timesteps": stage_chunk_steps,
                     "evaluation_disabled": True,
                     "promotion_disabled": True,
                     "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -1311,14 +1631,15 @@ def main() -> int:
                 "curriculum_plan": CURRICULUM_PLAN_ID,
                 "status": "stage_only_budget_complete",
                 "stage": stage,
-                "chunks_trained_this_invocation": max_chunks,
-                "chunk_timesteps": chunk_steps,
+                "chunks_trained_this_invocation": chunk_index,
+                "chunk_timesteps": stage_chunk_steps,
                 "evaluation_disabled": True,
                 "promotion_disabled": True,
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             })
             final_message = (
-                f"[Stage-only] BUDGET COMPLETE: trained {stage} for {max_chunks * chunk_steps:,} transitions. "
+                f"[Stage-only] BUDGET COMPLETE: trained {stage} for "
+                f"{('unlimited' if max_chunks == 0 else f'{chunk_index * stage_chunk_steps:,}')} transitions. "
                 "No evaluation was run and no promotion occurred."
             )
             print(f"\n{final_message}", flush=True)
@@ -1327,6 +1648,10 @@ def main() -> int:
 
         for stage_index in range(start_index, len(STAGES)):
             stage = STAGES[stage_index]
+            stage_chunk_steps = stage_training_chunk_steps(
+                stage, chunk_steps, ppo_n_steps, num_envs, train_episode_override
+            )
+            stage_train_limit = stage_training_episode_step_limit(stage, ppo_n_steps, train_episode_override)
             stage_start_state = stage_start_state_path(root, stage, initial_state)
             validate_stage_start_state(root, stage, stage_start_state, expected_rom_hash)
 
@@ -1345,7 +1670,7 @@ def main() -> int:
             report = None
             if checkpoint.is_file():
                 report = eval_stage(stage, stage_start_state)
-                if report is not None and float(report.get("success_rate", 0.0)) >= threshold:
+                if report is not None and evaluation_meets_gate(report, threshold):
                     if verified_fresh_milestone(stage, report):
                         mastered = True
                     else:
@@ -1356,33 +1681,33 @@ def main() -> int:
                         )
                 if report is not None and not mastered:
                     report = compare_archived_checkpoints(stage, stage_start_state, report)
-                    if float(report.get("success_rate", 0.0)) >= threshold and verified_fresh_milestone(stage, report):
+                    if evaluation_meets_gate(report, threshold) and verified_fresh_milestone(stage, report):
                         mastered = True
 
-            while not mastered and chunks_trained < max_chunks:
+            while not mastered and (max_chunks == 0 or chunks_trained < max_chunks):
                 chunks_trained += 1
                 chunk_message = (
-                    f"[Curriculum] Training stage={stage} chunk={chunks_trained}/{max_chunks} "
-                    f"additional_transitions={chunk_steps:,}."
+                    f"[Curriculum] Training stage={stage} chunk={chunks_trained}/{'unlimited' if max_chunks == 0 else max_chunks} "
+                    f"additional_transitions={stage_chunk_steps:,}."
                 )
                 print(f"\n{chunk_message}", flush=True)
                 append_curriculum_event(chunk_message)
-                train_env = base_env.copy()
-                train_env["POKEMON_AI_PROFILE"] = "fast_train"
-                train_env["POKEMON_AI_MODE"] = "train"
-                train_env["POKEMON_AI_GUI_MODE"] = "0"
-                train_env["POKEMON_AI_RECORD_VIDEO"] = "0"
-                train_env["POKEMON_AI_AUTO_START_TENSORBOARD"] = "0"
-                train_env["POKEMON_AI_OBJECTIVE"] = stage
-                train_env["POKEMON_AI_TRAINING_START_STATE"] = str(stage_start_state)
-                train_env["POKEMON_AI_TOTAL_TIMESTEPS"] = str(chunk_steps)
+                train_env = build_training_environment(
+                    base_env,
+                    stage=stage,
+                    start_state=stage_start_state,
+                    total_timesteps=stage_chunk_steps,
+                    max_episode_steps=stage_train_limit,
+                    stage_only=False,
+                    reset_entropy_for_stage=(chunks_trained == 1),
+                )
                 stream_command([str(python), "main.py"], train_env, root, run_log_path, args.dry_run)
                 if args.dry_run:
                     continue
                 report = eval_stage(stage, stage_start_state)
                 if report is None:
                     continue
-                if float(report.get("success_rate", 0.0)) >= threshold:
+                if evaluation_meets_gate(report, threshold):
                     mastered = verified_fresh_milestone(stage, report)
                     if not mastered:
                         print(
@@ -1391,7 +1716,7 @@ def main() -> int:
                         )
                 if not mastered:
                     report = compare_archived_checkpoints(stage, stage_start_state, report)
-                    if float(report.get("success_rate", 0.0)) >= threshold:
+                    if evaluation_meets_gate(report, threshold):
                         mastered = verified_fresh_milestone(stage, report)
 
                 if not args.dry_run:
@@ -1400,7 +1725,7 @@ def main() -> int:
                         "status": "running" if mastered else "stage_not_mastered",
                         "stage": stage,
                         "chunks_trained_this_invocation": chunks_trained,
-                        "chunk_timesteps": chunk_steps,
+                        "chunk_timesteps": stage_chunk_steps,
                         "success_threshold": threshold,
                         "last_evaluation_report": str(newest_report(log_dir, set()) or ""),
                         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -1410,7 +1735,7 @@ def main() -> int:
                 if not args.dry_run:
                     atomic_json(run_state_path, {
                         "schema_version": 2, "curriculum_plan": CURRICULUM_PLAN_ID, "status": "stage_not_mastered", "stage": stage,
-                        "chunks_trained_this_invocation": chunks_trained, "chunk_timesteps": chunk_steps,
+                        "chunks_trained_this_invocation": chunks_trained, "chunk_timesteps": stage_chunk_steps,
                         "success_threshold": threshold, "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     })
                 not_mastered_message = (
@@ -1421,14 +1746,18 @@ def main() -> int:
                 append_curriculum_event(not_mastered_message)
                 return 2
 
-            mastered_message = f"[Curriculum] MASTERED: {stage} ({OBJECTIVE_LABELS[stage]}); milestone verified."
+            mastered_archive = archive_mastered_checkpoint(root, model_name, stage)
+            mastered_message = (
+                f"[Curriculum] MASTERED: {stage} ({OBJECTIVE_LABELS[stage]}); "
+                f"milestone verified; snapshot={mastered_archive.name}."
+            )
             print(mastered_message, flush=True)
             if not args.dry_run:
                 append_curriculum_event(mastered_message)
             if not args.dry_run:
                 atomic_json(run_state_path, {
                     "schema_version": 2, "curriculum_plan": CURRICULUM_PLAN_ID, "status": "mastered", "stage": stage,
-                    "chunks_trained_this_invocation": chunks_trained, "chunk_timesteps": chunk_steps,
+                    "chunks_trained_this_invocation": chunks_trained, "chunk_timesteps": stage_chunk_steps,
                     "success_threshold": threshold, "milestone_state": str(milestone_dir / f"{stage}.state"),
                     "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 })

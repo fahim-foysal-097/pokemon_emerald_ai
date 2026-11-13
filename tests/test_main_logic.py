@@ -9,6 +9,7 @@ They do not replace a live-mGBA smoke test against the user's own ROM.
 from __future__ import annotations
 
 import os
+import importlib.util
 import tempfile
 import hashlib
 import inspect
@@ -20,6 +21,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+
+_MISSING_MAIN_DEPENDENCY = next((
+    name for name in ("gymnasium", "stable_baselines3", "sb3_contrib")
+    if importlib.util.find_spec(name) is None
+), None)
+if _MISSING_MAIN_DEPENDENCY is not None:
+    # Keep stdlib-only controller tests discoverable in lightweight review/CI
+    # containers. The full RAM/environment logic suite runs in the project's
+    # configured venv, where these runtime dependencies are installed.
+    raise unittest.SkipTest(
+        f"main.py integration tests require the project runtime dependency "
+        f"{_MISSING_MAIN_DEPENDENCY!r}"
+    )
 
 import main
 
@@ -170,6 +184,24 @@ class MainLogicTests(unittest.TestCase):
         self.assertEqual(audio.ffi.allocations, 1)
         self.assertEqual(audio._drain_scratch_values, 256)
         self.assertIsNone(audio.error)
+
+
+    def test_curriculum_event_telemetry_does_not_change_policy_observation_shape(self):
+        from curriculum_objectives import CURRICULUM_STORY_FLAG_IDS, FLAG_SYS_GAME_CLEAR, FLAG_POKENAV_RECEIVED
+        self.assertTrue(set(CURRICULUM_STORY_FLAG_IDS).issubset(set(main.CURRICULUM_FLAG_TELEMETRY_IDS)))
+        self.assertIn(FLAG_SYS_GAME_CLEAR, main.CURRICULUM_FLAG_TELEMETRY_IDS)
+        self.assertIn(FLAG_SYS_GAME_CLEAR >> 3, main.FLAG_BYTE_OFFSETS)
+        self.assertIn(FLAG_POKENAV_RECEIVED, main.CURRICULUM_FLAG_TELEMETRY_IDS)
+        # The neural-network input schema remains based only on OBS_STORY_FLAG_IDS.
+        for flag_id in set(CURRICULUM_STORY_FLAG_IDS) - set(main.OBS_STORY_FLAG_IDS):
+            self.assertNotIn(f"story_flag_{flag_id:03X}", main.STATE_FEATURE_NAMES)
+        env = object.__new__(main.EmeraldEnv)
+        wanted = {FLAG_SYS_GAME_CLEAR, FLAG_POKENAV_RECEIVED}
+        snapshot = {}
+        for flag_id in wanted:
+            byte_offset = flag_id >> 3
+            snapshot[byte_offset] = snapshot.get(byte_offset, 0) | (1 << (flag_id & 7))
+        self.assertTrue(wanted.issubset(env._read_story_flags(0x02010000, snapshot)))
 
     def test_reward_configuration_includes_small_battle_experience_component(self):
         self.assertIn("battle_exp", main.REWARD_COMPONENT_NAMES)
@@ -431,6 +463,9 @@ class MainLogicTests(unittest.TestCase):
         memory[main.PLAYER_PARTY_COUNT_ADDRESS] = 1
         live_mon = main.PLAYER_PARTY_ADDRESS
         memory[live_mon + main.PARTY_LEVEL_OFFSET] = 5
+        self.byte_map_write(
+            memory, sb1 + main.SAVE_BLOCK1_ROUTE110_STATE_OFFSET, 1, 2
+        )
 
         flags_base = sb1 + main.SAVE_BLOCK1_FLAGS_OFFSET
         for flag_id in (main.CLOCK_SET_FLAG_ID, main.STARTER_OBTAINED_FLAG_ID, 0x500, 0x867):
@@ -449,7 +484,33 @@ class MainLogicTests(unittest.TestCase):
         self.assertIn(main.CLOCK_SET_FLAG_ID, state["story_flags"])
         self.assertIn(main.STARTER_OBTAINED_FLAG_ID, state["story_flags"])
         self.assertIn(0x500, state["trainer_flags"])
+        self.assertEqual(main.SAVE_BLOCK1_ROUTE110_STATE_OFFSET, 0x146E)
+        self.assertEqual(state["route110_state"], 1)
+        self.assertTrue(state["route110_var_telemetry_valid"])
         self.assertNotIn("route101_state", state)
+
+    def test_unstable_route110_save_var_is_not_trusted(self):
+        env = object.__new__(main.EmeraldEnv)
+        memory: dict[int, int] = {}
+        env._read8 = lambda address: memory.get(int(address), 0)
+        saveblock = 0x02010000
+        self.byte_map_write(memory, main.SAVE_BLOCK1_PTR_ADDRESS, saveblock, 4)
+        memory[main.PLAYER_PARTY_COUNT_ADDRESS] = 1
+        memory[main.PLAYER_PARTY_ADDRESS + main.PARTY_LEVEL_OFFSET] = 5
+        memory[saveblock + main.SAVE_BLOCK1_LOCATION_OFFSET] = 0
+        memory[saveblock + main.SAVE_BLOCK1_LOCATION_OFFSET + 1] = 25
+        route110_address = saveblock + main.SAVE_BLOCK1_ROUTE110_STATE_OFFSET
+        route110_reads = iter((1, 0))
+        def read16(address):
+            if int(address) == route110_address:
+                return next(route110_reads)
+            return memory.get(int(address), 0) | (memory.get(int(address) + 1, 0) << 8)
+
+        env._read16 = read16
+        state = env._read_game_state()
+        self.assertTrue(state["flag_telemetry_valid"])
+        self.assertFalse(state["route110_var_telemetry_valid"])
+        self.assertIsNone(state["route110_state"])
 
     def test_live_party_is_authoritative_for_effective_starter_flag(self):
         env = object.__new__(main.EmeraldEnv)
@@ -575,6 +636,21 @@ class MainLogicTests(unittest.TestCase):
         self.assertFalse(main._objective_satisfied("pokedex", starter_state))
         self.assertTrue(main._objective_satisfied("first_badge", dict(starter_state, badge_count=1)))
         self.assertFalse(main._objective_satisfied("first_badge", starter_state))
+        route110_start = dict(
+            starter_state, map_id=25, route110_state=0,
+            route110_var_telemetry_valid=True,
+        )
+        self.assertFalse(main._objective_satisfied("defeat_rival_route110", route110_start))
+        self.assertFalse(main._objective_satisfied(
+            "defeat_rival_route110",
+            dict(route110_start, story_flags={0xD3}, route110_state=0),
+        ))
+        self.assertTrue(main._objective_satisfied(
+            "defeat_rival_route110", dict(route110_start, route110_state=1)
+        ))
+        self.assertFalse(main._objective_satisfied(
+            "defeat_rival_route110", dict(route110_start, route110_state=1, route110_var_telemetry_valid=False)
+        ))
         self.assertFalse(main._objective_satisfied("starter", None))
         with self.assertRaisesRegex(ValueError, "Unknown objective"):
             main._objective_satisfied("made_up_goal", starter_state)
@@ -831,6 +907,16 @@ class MainLogicTests(unittest.TestCase):
         self.assertTrue(main._evaluation_has_explicit_progress({"party_experience_delta": 120}))
         self.assertFalse(main._evaluation_has_explicit_progress({"ram_read_failed": True, "new_story_flags": 1}))
         self.assertFalse(main._evaluation_has_explicit_progress({"new_story_flags": 0, "new_trainer_flags": 0}))
+
+    def test_evaluation_gate_futility_stops_only_when_threshold_is_unreachable(self):
+        self.assertFalse(main._evaluation_gate_unreachable(0, 1, 10, 0.9))
+        self.assertTrue(main._evaluation_gate_unreachable(0, 2, 10, 0.9))
+        self.assertFalse(main._evaluation_gate_unreachable(4, 4, 5, 0.9))
+        with self.assertRaises(ValueError):
+            main._evaluation_gate_unreachable(4, 1, 5, 0.9)
+        self.assertTrue(main._evaluation_gate_unreachable(0, 1, 5, 0.9))
+        self.assertFalse(main._evaluation_gate_unreachable(2, 3, 5, 0.8))
+        self.assertTrue(main._evaluation_gate_unreachable(1, 3, 5, 0.8))
 
     def test_screen_signature_is_stable_and_detects_large_layout_changes(self):
         unchanged_a = np.zeros((main.OBS_HEIGHT, main.OBS_WIDTH, 3), dtype=np.uint8)

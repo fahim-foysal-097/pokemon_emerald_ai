@@ -94,6 +94,25 @@ class RuntimeStateResolutionTests(unittest.TestCase):
                 training_start_state=self.leave_lab_milestone,
             )
 
+
+    def test_continuous_tour_ignores_stale_stage_state_and_uses_canonical_start(self):
+        resolved = resolve_runtime_start_state_path(
+            self.root,
+            "defeat_champion",
+            mode="watch",
+            canonical_start_state=self.canonical,
+            training_start_state=self.leave_lab_milestone,
+            continuous_tour=True,
+        )
+        self.assertEqual(resolved, self.canonical.resolve())
+
+    def test_continuous_tour_is_watch_only(self):
+        with self.assertRaisesRegex(ValueError, "only valid with mode='watch'"):
+            resolve_runtime_start_state_path(
+                self.root, "defeat_champion", mode="train",
+                canonical_start_state=self.canonical, continuous_tour=True,
+            )
+
     def test_legacy_starter_training_path_is_promoted_to_canonical(self):
         custom = self.root / "older_canonical.state"
         custom.write_bytes(b"legacy")

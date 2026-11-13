@@ -38,4 +38,9 @@ printf '[launcher] Project: %s\n' "$ROOT"
 printf '[launcher] Python:  %s\n' "$PYTHON"
 printf '[launcher] mGBA:    %s\n' "$BUILD_DIR"
 
+if [[ "${1:-}" == "--auto" || "${1:-}" == "auto" ]]; then
+  shift
+  exec "$PYTHON" -u "$ROOT/run_autonomous.py" "$@"
+fi
+
 exec "$PYTHON" -u "$ROOT/main.py" "$@"

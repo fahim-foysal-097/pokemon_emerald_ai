@@ -32,6 +32,26 @@ class MainSourceGuardTests(unittest.TestCase):
         self.assertNotIn("self._last_party_debug_signature = None", reset)
         self.assertNotIn("self._last_party_debug_signature = None", step)
 
+    def test_noisy_ram_diagnostics_respect_verbose_level(self):
+        step = _method_source(self.tree, "EmeraldEnv", "step")
+        self.assertIn(
+            "if VERBOSE_LEVEL >= 2 and flag_diag_signature != self._last_flag_diag_signature:",
+            step,
+        )
+        self.assertIn(
+            "if VERBOSE_LEVEL >= 2 and live_party_count != saved_party_count:",
+            step,
+        )
+        self.assertIn(
+            "if VERBOSE_LEVEL >= 2 or (VERBOSE_LEVEL >= 1 and self.env_id == 0):",
+            step,
+        )
+        # SaveBlock1 relocation alone must not trigger a new raw-flag diagnostic.
+        flag_block_start = step.index("flag_diag_signature = (")
+        flag_block_end = step.index("if VERBOSE_LEVEL >= 2 and flag_diag_signature", flag_block_start)
+        flag_signature = step[flag_block_start:flag_block_end]
+        self.assertNotIn('state.get("saveblock1_ptr")', flag_signature)
+
     def test_parent_profiler_is_installed_only_for_opt_in_training(self):
         self.assertIn("from runtime_profiler import RuntimeProfiler", self.source)
         self.assertIn("RuntimeProfiler(enabled=TIMING_DIAGNOSTICS)", self.source)
@@ -133,6 +153,33 @@ class MainSourceGuardTests(unittest.TestCase):
         curriculum_source = CURRICULUM_SOURCE.read_text(encoding="utf-8")
         self.assertIn("if score[0] <= baseline_success_rate or score[0] <= 0.0:", curriculum_source)
         self.assertIn("if full_score[0] <= baseline_success_rate:", curriculum_source)
+
+    def test_training_peak_metrics_v2_are_loaded_with_v1_backward_compatibility(self):
+        self.assertIn('persisted.get("schema_version") in {1, 2}', self.source)
+        self.assertIn('"schema_version": 2', self.source)
+        loader_start = self.source.index('with open(self._peak_metrics_path, "r", encoding="utf-8")')
+        loader_end = self.source.index('self._recent_episode_success.clear()', loader_start)
+        loader = self.source[loader_start:loader_end]
+        self.assertIn('persisted.get("schema_version") in {1, 2}', loader)
+
+    def test_navigation_objectives_do_not_reward_unrelated_story_or_battle_progress(self):
+        step = _method_source(self.tree, "EmeraldEnv", "step")
+        self.assertIn("if not NAVIGATION_OBJECTIVE and self.episode_step_counter % BATTLE_EXP_POLL_INTERVAL == 0:", step)
+        self.assertIn('0.0 if NAVIGATION_OBJECTIVE else BADGE_REWARD * new_badges', step)
+        self.assertIn('0.0 if NAVIGATION_OBJECTIVE else PARTY_MEMBER_REWARD * party_members_added', step)
+        self.assertIn('0.0 if NAVIGATION_OBJECTIVE', step)
+        self.assertIn('min(4, len(new_trainer_flags)) * TRAINER_WIN_REWARD', step)
+        self.assertIn('or component["badge"] > 0.0', step)
+        self.assertIn('or component["trainer"] > 0.0', step)
+
+    def test_entropy_annealing_resumes_from_checkpoint_coefficient(self):
+        start = _method_source(self.tree, "StopAndCheckpointCallback", "_on_training_start")
+        rollout = _method_source(self.tree, "StopAndCheckpointCallback", "_on_rollout_end")
+        self.assertIn('getattr(self.model, "ent_coef", None)', start)
+        self.assertIn('POKEMON_AI_ENTROPY_RESET_FOR_STAGE', start)
+        self.assertIn("self._entropy_start_for_run", start)
+        self.assertIn("ENTROPY_COEF_END - self._entropy_start_for_run", rollout)
+        self.assertNotIn("ENTROPY_COEF_START + (ENTROPY_COEF_END - ENTROPY_COEF_START)", rollout)
 
     def test_worker_reset_timing_is_reported_separately(self):
         reset = _method_source(self.tree, "EmeraldEnv", "reset")

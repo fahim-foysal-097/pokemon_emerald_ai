@@ -13,7 +13,7 @@ A local reinforcement-learning agent for **vanilla Pokémon Emerald (BPEE rev 0)
 
 ## Requirements and game data
 
-Use the project's existing `.venv` and `run.sh`; the launcher configures the local mGBA build and native-library paths. Dependencies are listed in `requirements-rl.txt`.
+Use the project's existing `.venv` and `run.sh`; the launcher configures the local mGBA build and native-library paths. Dependencies are listed in `requirements.txt`.
 
 Place your legally obtained, unmodified ROM at `PokemonEmerald.gba` beside `main.py`. The default identity check expects SHA-1 `f3ae088181bf583e55daf962a92bb46f4f1d07b7`:
 
@@ -47,8 +47,17 @@ Play to the required position and press **K** to capture the state, then quit se
 ./run.sh --profile evaluate
 
 # Watch the policy in a visible window / headless at maximum speed
+# Watch AI in GUI (press F or click FF to toggle Fast-Forward)
 ./run.sh --profile gui_watch
-./run.sh --profile fast_watch
+
+# Watch AI on any specific stage (e.g. reach_route101, first_badge)
+./run.sh --profile gui_watch --stage reach_route101
+
+# Continuous tour: AI plays from the canonical Route 101 start through all cleared milestones
+./run.sh --profile continuous_watch
+
+# Run the fully autonomous full-game controller (auto-configures, trains, evaluates, promotes)
+./run.sh --auto
 
 # Prepare the canonical start state
 ./run.sh --profile setup
@@ -56,37 +65,38 @@ Play to the required position and press **K** to capture the state, then quit se
 
 The model is saved as `<POKEMON_AI_MODEL_NAME>.zip` in the project root (default `emerald_ppo_hybrid_v1.zip`). Resume with `POKEMON_AI_RESUME=1`; with resume enabled, `POKEMON_AI_TOTAL_TIMESTEPS` is the budget for the next training call, not a lifetime cap from timestep zero. Use a new `POKEMON_AI_MODEL_NAME` for a separate experiment.
 
-## Incremental curriculum
+## Fully Autonomous Full-Game Curriculum
 
-The stage order is defined once in `curriculum_objectives.py` and shared by the environment and controller:
+The curriculum spans 58 sequential milestones across the entire Pokémon Emerald story, from the canonical post-clock/pre-starter Route 101 state through all 8 Gym Badges and Champion Wallace. Event predicates use the vanilla BPEE event-flag definitions and are checked against decoded RAM telemetry.
 
-1. `starter` — rescue Birch, win the opening wild battle and reach the lab.
-2. `leave_birch_lab` — complete the lab introduction and leave onto Route 101.
-3. `reach_oldale` — reach Oldale Town.
-4. `reach_route103` — reach Route 103.
-5. `defeat_rival` — defeat May on Route 103.
-6. `return_birch_lab` — return to Birch's Lab.
-7. `pokedex` — obtain the Pokédex.
-8. `first_badge` — obtain the first Gym Badge.
-
-Run the controller to evaluate, train and promote through verified milestones:
+Launch the autonomous controller with a single command:
 
 ```bash
-.venv/bin/python run_curriculum.py --dry-run
-.venv/bin/python run_curriculum.py
+# Preview the full roadmap without running
+./run.sh --auto --dry-run
+
+# Run the complete autonomous pipeline
+./run.sh --auto
 ```
 
-The controller evaluates the current checkpoint before training, trains in chunks when needed, and promotes only after the configured evaluation gate passes and a fresh, matching milestone savestate and manifest exist. Deterministic fixed-start evaluation checks reproducibility; it does not prove robustness across arbitrary starting states.
+The autonomous controller automatically:
+1. Resumes from the current stage in `runtime_data/curriculum_state.json`.
+2. Computes the required rollout horizon and chunk budget dynamically.
+3. Passes stage-specific configuration to child processes without rewriting `.env`.
+4. Executes stage-scaled, complete vector-rollout training chunks, applying the selected stage's own per-environment episode cap to every training child process.
+5. Evaluates using `POKEMON_AI_CURRICULUM_EVAL_EPISODES` from `.env` (the supplied configuration and controller fallback both use 5) against the configured success gate. It stops between episodes as soon as the gate becomes mathematically unreachable; incomplete evaluations can never promote a stage. With 5 episodes and a 90% gate, all 5 must pass (a single failure makes 90% impossible); with 10 episodes and a 90% gate, 9 must pass (the second failure makes 90% impossible). Promotion still requires a complete passing evaluation and a fresh milestone savestate/manifest matching the evaluated checkpoint and ROM.
+6. When the current model misses the gate, screens recent distinct, ZIP-validated checkpoints, fully evaluates a promising candidate, and activates it only if its objective success rate improves.
+7. Archives `<model>_<stage>_mastered.zip` after each verified promotion and continues until Champion Wallace is defeated. Autonomous mode defaults to unlimited chunks per stage (matching the original runner); pass `--max-chunks-per-stage N` to cap it, with `0` meaning unlimited. The direct `run_curriculum.py` entry point still reads the `.env` chunk limit.
 
-### Train one stage without evaluation or promotion
+**Ctrl+C shutdown:** `run_autonomous.py` launches the curriculum controller in an isolated process session and forwards Ctrl+C to it. The curriculum controller then signals its active `main.py` process and waits for cleanup. During training, `main.py` finishes the current PPO rollout and optimizer update, atomically saves the latest verified model, archives it when possible, saves emulator states, and closes workers. During evaluation, no model weights are changed; the active evaluation episode is abandoned, the emulator state is saved during environment cleanup, and the curriculum is marked interrupted so the incomplete evaluation cannot promote a stage. The launcher waits for the controller's full shutdown window and only escalates if graceful cleanup times out. A normal Ctrl+C should return to the shell without an uncaught `KeyboardInterrupt` traceback. Do not use `kill -9` as a normal stop method.
 
-Stage-only mode trains one selected objective for the configured number of chunks, then exits. It skips evaluation, archive comparison and automatic stage promotion. Use it to spend longer on a difficult stage without the controller moving on:
+See [CURRICULUM_STAGES.md](CURRICULUM_STAGES.md) for the complete 58-stage specification.
 
-```bash
-.venv/bin/python run_curriculum.py --start-stage leave_birch_lab --stage-only
-```
+### Visual Inspection & Fast Forward
 
-Alternatively set `POKEMON_AI_CURRICULUM_STAGE_ONLY=1` and `POKEMON_AI_OBJECTIVE=<stage>` in `.env`. Stages after `starter` still require the previous verified milestone. Set stage-only back to `0` before normal evaluate/promote curriculum runs.
+- **Fast Forward**: In any GUI window (`gui_watch`, `gui_train`, `continuous_watch`), press `F` or `Spacebar` (or click `[FF: ON/OFF]` in the top-right overlay) to run unthrottled at maximum hardware speed. Press again to return to 60 FPS.
+- **Inspect Any Stage**: Run `./run.sh --profile gui_watch --stage <stage_name>` to boot into any verified milestone.
+- **Continuous Tour**: Run `./run.sh --profile continuous_watch` to watch the AI from the canonical `runtime_data/states/training_start.state` (post-clock, pre-starter Route 101) without per-stage resets. A stale stage-specific start-state setting is intentionally ignored in this mode.
 
 ## Configure a time budget
 
@@ -102,9 +112,9 @@ Repeat without `--dry-run` to review and confirm the `.env` write, or run it wit
 
 - `stage` — direct single-objective training with a stage-specific episode cap.
 - `stage-only` — controller-managed chunks, with evaluation and promotion disabled.
-- `curriculum` — automatic evaluation and promotion across remaining stages; evaluation time is additional and may stop early at a failed gate.
+- `curriculum` — automatic evaluation and promotion across remaining stages. Each training process receives its own stage episode cap; evaluation can stop early only after enough completed failures make the configured gate impossible.
 
-Episode presets are starting heuristics, not guarantees of task completion. `POKEMON_AI_MAX_EPISODE_STEPS` counts policy decisions per environment, not GBA frames. Ensure the configured total budget and chunks are compatible with the rollout size.
+Episode presets are starting heuristics, not guarantees of task completion. `POKEMON_AI_MAX_EPISODE_STEPS` counts policy decisions per environment, not GBA frames, and remains the direct/standalone training setting. The curriculum controller overrides it with each stage's preset. To intentionally override all curriculum training episode caps, set `POKEMON_AI_CURRICULUM_TRAIN_MAX_EPISODE_STEPS`; stage-only plans written by the configurator set this explicitly for the selected stage. Ensure the configured total budget and chunks are compatible with the rollout size. Pass `--eval-episodes N`, `--gate RATE`, or `--max-chunks-per-stage N` to `run_autonomous.py` only when you want to override `.env`; omitted options respect `.env`. The per-episode evaluation hard limit remains stage-specific (the same objective horizon used by its stage preset), and `POKEMON_AI_EVAL_NO_PROGRESS_STEPS` defaults to 4,096 decisions to end a run that is no longer making meaningful game progress.
 
 For `N` environments and `POKEMON_AI_PPO_N_STEPS` steps per environment, one vector rollout is:
 
@@ -124,6 +134,16 @@ Model writes are atomic. Periodic checkpoints follow `POKEMON_AI_CHECKPOINT_EVER
 
 `POKEMON_AI_MINI_EPISODE_STEPS` starts a soft exploration-memory window for later objectives. It resets short-term visit/loop memory only—it does **not** reset the game, end a Gymnasium episode, or reset the LSTM state.
 
+## Console verbosity
+
+`POKEMON_AI_VERBOSE` controls low-level diagnostic output without disabling training progress, checkpoint notifications, warnings, or errors:
+
+- `0` — quiet normal training. Suppresses per-worker SaveBlock1 flag dumps, party RAM mismatch tables, and mini-episode boundary messages.
+- `1` — normal verbosity. Reports mini-episode boundaries from worker 0 only; suppresses low-level RAM diagnostic dumps.
+- `2` — debug verbosity. Enables SaveBlock1 flag and party RAM diagnostics and reports mini-episode boundaries from every worker. SaveBlock1 flag dumps are triggered by changes in the sampled flag bytes/validity, not by pointer-address relocation alone.
+
+Changing this setting affects logging only. Mini-episode exploration-memory resets, RAM sampling, reward calculation, PPO rollouts, and checkpoint behavior continue unchanged.
+
 ## Rewards and monitoring
 
 The active objective receives `POKEMON_AI_TASK_SUCCESS_REWARD` on success. Additional signals include exploration novelty, party/level/badge progress, story flags, trainer wins, small party-EXP increases, and loop/stagnation penalties. EXP reward is a shaping proxy, not a guaranteed one-time reward for every wild-battle victory; the battle's actual event flags and live RAM telemetry remain important.
@@ -139,12 +159,14 @@ Run tests in the project's virtual environment:
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Unit tests use mocked RAM and temporary checkpoints; they do not replace a live smoke test with the local ROM and mGBA binding. Review source changes with Git and validate stage transitions before relying on long runs.
+Unit tests use mocked RAM and temporary checkpoints; they do not replace a live smoke test with the local ROM and mGBA binding. The `test_main_logic.py` RAM/environment suite requires Gymnasium, Stable-Baselines3, and SB3-Contrib; lightweight environments without those packages skip that module explicitly. See [TEST_REPORT.md](TEST_REPORT.md) for the verification scope and limitations. Review source changes with Git and validate stage transitions before relying on long runs.
+
+Saved v5 milestones can resume only after their decoded state passes the corrected v6 objective predicate. v4 migration is restricted to the unchanged starter predecessor; incompatible or false-positive legacy milestones are rejected rather than silently promoted.
 
 
 ## Train / interrupt
 
-The supplied `.env` keeps the previous one-chunk starter-stage budget: 245,760 transitions. To run it:
+The supplied `.env` keeps the bounded one-chunk stage-only budget for direct stage-only runs; `./run.sh --auto` overrides that with unlimited chunks per stage by default. The autonomous parent owns the optional TensorBoard process; its child training/evaluation workers do not start duplicate servers. To run it:
 
 ```bash
 .venv/bin/python run_curriculum.py --start-stage starter --stage-only

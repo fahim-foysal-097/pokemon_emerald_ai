@@ -24,9 +24,12 @@ from collections import Counter, deque
 
 from important_logging import filter_persistent_log_text, should_flush_important_log, is_exception_end
 from curriculum_objectives import (
-    OBJECTIVE_DEFINITIONS, OBJECTIVES_REQUIRING_FLAG_TELEMETRY, STAGES,
-    ROUTE_101_MAP_ID, objective_satisfied as _objective_satisfied,
-    objective_start_error, resolve_runtime_start_state_path,
+    OBJECTIVE_DEFINITIONS, OBJECTIVES_REQUIRING_FLAG_TELEMETRY,
+    OBJECTIVES_REQUIRING_VAR_TELEMETRY, STAGES,
+    CURRICULUM_PLAN_ID, CURRICULUM_STORY_FLAG_IDS, ROUTE_101_MAP_ID,
+    VAR_ROUTE110_STATE_ID, evaluation_gate_unreachable as _evaluation_gate_unreachable,
+    is_navigation_objective as _is_navigation_objective,
+    objective_satisfied as _objective_satisfied, objective_start_error, resolve_runtime_start_state_path,
 )
 
 
@@ -167,6 +170,18 @@ _PROFILE_PRESETS = {
             "POKEMON_AI_AUTO_START_TENSORBOARD": "0",
         },
     },
+    "continuous_watch": {
+        "label": "Watch AI tour continuously across all milestones starting from Route 101",
+        "env": {
+            "POKEMON_AI_MODE": "watch",
+            "POKEMON_AI_GUI_MODE": "1",
+            "POKEMON_AI_WATCH_FPS": "0",
+            "POKEMON_AI_RECORD_VIDEO": "0",
+            "POKEMON_AI_AUTO_START_TENSORBOARD": "0",
+            "POKEMON_AI_OBJECTIVE": "defeat_champion",
+            "POKEMON_AI_CONTINUOUS_TOUR": "1",
+        },
+    },
 }
 _PROFILE_ALIASES = {
     "default": "fast_train",
@@ -186,12 +201,17 @@ _PROFILE_ALIASES = {
     "fast_forward": "fast_watch",
     "eval": "evaluate",
     "evaluation": "evaluate",
+    "tour": "continuous_watch",
+    "continuous": "continuous_watch",
+    "whole_game": "continuous_watch",
+    "game_tour": "continuous_watch",
 }
 
 
 def _apply_runtime_profile():
-    """Apply a named profile and consume optional --profile CLI arguments."""
+    """Apply a named profile and consume optional --profile and --stage CLI arguments."""
     cli_profile = None
+    cli_stage = None
     retained_args = [sys.argv[0]]
     args = list(sys.argv[1:])
     i = 0
@@ -211,9 +231,30 @@ def _apply_runtime_profile():
             cli_profile = arg.split("=", 1)[1]
             i += 1
             continue
+        if arg == "--stage":
+            if i + 1 >= len(args):
+                raise SystemExit("Missing stage name after --stage.")
+            cli_stage = args[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--stage="):
+            cli_stage = arg.split("=", 1)[1]
+            i += 1
+            continue
         retained_args.append(arg)
         i += 1
     sys.argv[:] = retained_args
+
+    if cli_stage is not None:
+        stage_norm = cli_stage.strip().lower()
+        if stage_norm not in STAGES:
+            raise SystemExit(f"Unknown stage {cli_stage!r}. Available stages: {', '.join(STAGES)}")
+        os.environ["POKEMON_AI_OBJECTIVE"] = stage_norm
+        try:
+            mapped_start = resolve_runtime_start_state_path(PROJECT_DIR, stage_norm, mode="watch")
+            os.environ["POKEMON_AI_TRAINING_START_STATE"] = str(mapped_start)
+        except Exception as exc:
+            pass
 
     requested = cli_profile if cli_profile is not None else os.environ.get("POKEMON_AI_PROFILE", "fast_train")
     normalized = requested.strip().lower().replace("-", "_").replace(" ", "_")
@@ -786,6 +827,7 @@ EXPECTED_ROM_SHA1 = os.environ.get(
 REQUIRE_ROM_SHA1 = _env_flag("POKEMON_AI_REQUIRE_ROM_SHA1", True)
 MILESTONE_DIR = os.path.join(STATE_DIR, "milestones")
 MILESTONE_SAVE_ENABLED = _env_flag("POKEMON_AI_MILESTONE_SAVE", True)
+CONTINUOUS_TOUR = _env_flag("POKEMON_AI_CONTINUOUS_TOUR", False)
 CARTRIDGE_SAVE_PATH = os.path.join(BASE_DIR, "PokemonEmerald.sav")
 # This version uses a Dict observation (screen + structured game state + visited-tile memory)
 # and an action space with WAIT. Keep it separate from the old RGB-only, 8-action checkpoint.
@@ -888,6 +930,13 @@ if EVAL_STAGNATION_STEPS < 16:
 EVAL_NO_PROGRESS_STEPS = int(os.environ.get("POKEMON_AI_EVAL_NO_PROGRESS_STEPS", "4096"))
 if EVAL_NO_PROGRESS_STEPS < 128:
     raise ValueError("POKEMON_AI_EVAL_NO_PROGRESS_STEPS must be >= 128")
+# Curriculum evaluations can stop after a completed episode once the success
+# threshold is mathematically unreachable. Standalone fixed-count evaluation stays
+# exhaustive unless explicitly enabled by the caller.
+EVAL_STOP_IF_GATE_UNREACHABLE = _env_flag("POKEMON_AI_EVAL_STOP_IF_GATE_UNREACHABLE", False)
+EVAL_SUCCESS_THRESHOLD = float(os.environ.get("POKEMON_AI_EVAL_SUCCESS_THRESHOLD", "0.9"))
+if not math.isfinite(EVAL_SUCCESS_THRESHOLD) or not 0.0 < EVAL_SUCCESS_THRESHOLD <= 1.0:
+    raise ValueError("POKEMON_AI_EVAL_SUCCESS_THRESHOLD must be in (0, 1]")
 # General, non-directional shaping. Existing milestone and progression rewards remain;
 # novelty rewards decay across episodes so revisiting familiar places is less profitable.
 STEP_PENALTY = float(os.environ.get("POKEMON_AI_STEP_PENALTY", "0.00005"))
@@ -915,7 +964,7 @@ TIMING_DIAGNOSTICS = _env_flag("POKEMON_AI_TIMING_DIAGNOSTICS", False)
 LOOP_PENALTY = float(os.environ.get("POKEMON_AI_LOOP_PENALTY", "0.05"))
 LOOP_STAGNATION_STEPS = int(os.environ.get("POKEMON_AI_LOOP_STAGNATION_STEPS", "512"))
 LOOP_PENALTY_INTERVAL = int(os.environ.get("POKEMON_AI_LOOP_PENALTY_INTERVAL", "256"))
-TASK_SUCCESS_REWARD = float(os.environ.get("POKEMON_AI_TASK_SUCCESS_REWARD", "30.0"))
+TASK_SUCCESS_REWARD = float(os.environ.get("POKEMON_AI_TASK_SUCCESS_REWARD", "75.0"))
 for _reward_name, _reward_value in {
     "STEP_PENALTY": STEP_PENALTY,
     "LEVEL_REWARD_PER_LEVEL": LEVEL_REWARD_PER_LEVEL,
@@ -941,6 +990,11 @@ if LOOP_STAGNATION_STEPS < 1 or LOOP_PENALTY_INTERVAL < 1:
     raise ValueError("Loop-detection step settings must be positive integers")
 SAVE_BLOCK1_PTR_ADDRESS = 0x03005D8C
 SAVE_BLOCK1_FLAGS_OFFSET = 0x1270
+SAVE_BLOCK1_VARS_OFFSET = 0x139C
+EMERALD_VARS_START = 0x4000
+SAVE_BLOCK1_ROUTE110_STATE_OFFSET = (
+    SAVE_BLOCK1_VARS_OFFSET + (VAR_ROUTE110_STATE_ID - EMERALD_VARS_START) * 2
+)
 SAVE_BLOCK1_POS_X_OFFSET = 0x00
 SAVE_BLOCK1_POS_Y_OFFSET = 0x02
 SAVE_BLOCK1_LOCATION_OFFSET = 0x04  # struct WarpData: mapGroup, mapNum, warpId, x, y
@@ -984,7 +1038,13 @@ for _town_flag in range(0x86F, 0x87F):
 OBS_STORY_FLAG_IDS = tuple(sorted(STORY_FLAG_REWARDS))
 # FLAG_BADGE01_GET through FLAG_BADGE08_GET are 0x867..0x86E in standard Emerald.
 BADGE_FLAG_IDS = tuple(range(0x867, 0x86F))
-FLAG_BYTE_OFFSETS = tuple(sorted({flag_id >> 3 for flag_id in set(OBS_STORY_FLAG_IDS) | set(BADGE_FLAG_IDS)}))
+# Curriculum verification reads every referenced story flag. This is RAM telemetry
+# only: STATE_FEATURE_NAMES and OBS_STORY_FLAG_IDS stay unchanged for checkpoint ABI.
+CURRICULUM_FLAG_TELEMETRY_IDS = tuple(sorted(set(CURRICULUM_STORY_FLAG_IDS) | set(OBS_STORY_FLAG_IDS)))
+FLAG_BYTE_OFFSETS = tuple(sorted({
+    flag_id >> 3
+    for flag_id in set(CURRICULUM_FLAG_TELEMETRY_IDS) | set(BADGE_FLAG_IDS)
+}))
 PREVIOUS_ACTION_FEATURE_NAMES = (
     "previous_action_wait", "previous_action_up", "previous_action_down",
     "previous_action_left", "previous_action_right", "previous_action_a",
@@ -1010,6 +1070,7 @@ if OBJECTIVE_NAME not in OBJECTIVE_DEFINITIONS:
         "POKEMON_AI_OBJECTIVE must be one of: " + ", ".join(OBJECTIVE_DEFINITIONS)
     )
 OBJECTIVE_LABEL = OBJECTIVE_DEFINITIONS[OBJECTIVE_NAME]["label"]
+NAVIGATION_OBJECTIVE = _is_navigation_objective(OBJECTIVE_NAME)
 
 
 def _start_state_recovery_hint() -> str:
@@ -1037,6 +1098,7 @@ TRAINING_START_STATE = str(resolve_runtime_start_state_path(
     mode=MODE,
     canonical_start_state=os.environ.get("POKEMON_AI_CANONICAL_START_STATE", "").strip() or None,
     training_start_state=_configured_start_state or None,
+    continuous_tour=CONTINUOUS_TOUR,
 ))
 
 if MODE == "setup" and _configured_start_state:
@@ -2086,6 +2148,9 @@ class EmeraldEnv(gym.Env):
         self._save_training_start_requested = False
         self.window_created = False
         self._mouse_callback_available = False
+        self.fast_forward = False
+        self._achieved_tour_stages = set()
+        self._ff_button_rect = None
         self._first_reset = True
         self._episode_start_buffer = None
         self._episode_start_buffer_kind = None
@@ -2438,6 +2503,13 @@ class EmeraldEnv(gym.Env):
     def _on_gui_mouse(self, event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONUP:
             return
+        ff_rect = getattr(self, "_ff_button_rect", None)
+        if ff_rect is not None:
+            fx1, fy1, fx2, fy2 = ff_rect
+            if fx1 <= x <= fx2 and fy1 <= y <= fy2:
+                self.fast_forward = not getattr(self, "fast_forward", False)
+                print(f"[GUI] Fast Forward {'ON' if self.fast_forward else 'OFF'}.", flush=True)
+                return
         rect = getattr(self, "_audio_button_rect", None)
         if rect is None:
             return
@@ -2962,7 +3034,7 @@ class EmeraldEnv(gym.Env):
         return x, y
 
     def _read_flag_byte_snapshot(self, saveblock1_ptr):
-        """Read every byte containing a curated story or badge flag exactly once."""
+        """Read every byte containing a policy, curriculum, or badge flag exactly once."""
         if saveblock1_ptr is None:
             raise ValueError("Cannot read SaveBlock1 flags without a valid pointer")
         flags_base = saveblock1_ptr + SAVE_BLOCK1_FLAGS_OFFSET
@@ -2982,12 +3054,17 @@ class EmeraldEnv(gym.Env):
         return found
 
     def _read_story_flags(self, saveblock1_ptr, byte_snapshot=None):
-        """Read curated persistent story flags from a supplied stable snapshot."""
+        """Read policy and full-curriculum flags from one stable RAM snapshot.
+
+        Only OBS_STORY_FLAG_IDS contribute to the neural-network observation and
+        shaped rewards. The additional curriculum IDs are returned in state telemetry
+        for objective verification; they do not alter the trained policy input size.
+        """
         if saveblock1_ptr is None:
             return set()
         if byte_snapshot is None:
             byte_snapshot = self._read_flag_byte_snapshot(saveblock1_ptr)
-        return self._decode_flag_set(STORY_FLAG_REWARDS, byte_snapshot)
+        return self._decode_flag_set(CURRICULUM_FLAG_TELEMETRY_IDS, byte_snapshot)
 
     def _read_badge_flags(self, saveblock1_ptr, byte_snapshot=None):
         """Return the 8-bit badge mask from the official system-flag bytes."""
@@ -3070,6 +3147,9 @@ class EmeraldEnv(gym.Env):
 
         # Capture the curated story/badge flag bytes before reading the rest of the state.
         flag_bytes_first = self._read_flag_byte_snapshot(saveblock1_ptr)
+        route110_state_first = self._read16(
+            saveblock1_ptr + SAVE_BLOCK1_ROUTE110_STATE_OFFSET
+        )
 
         # Read both versions for diagnostics, but trust the live globals for gameplay.
         # SavePlayerParty() copies the globals into SaveBlock1 on save; its party fields
@@ -3123,10 +3203,17 @@ class EmeraldEnv(gym.Env):
         # Re-read the same curated bytes and pointer after all related reads. A
         # snapshot is valid only if the source remained identical throughout.
         flag_bytes_second = self._read_flag_byte_snapshot(saveblock1_ptr)
+        route110_state_second = self._read16(
+            saveblock1_ptr + SAVE_BLOCK1_ROUTE110_STATE_OFFSET
+        )
+        route110_var_snapshot_stable = route110_state_first == route110_state_second
         pointer_after = self._read_saveblock1_pointer()
         saveblock_pointer_stable = pointer_after == saveblock1_ptr
         flag_bytes_stable = flag_bytes_first == flag_bytes_second
         flag_snapshot_valid = bool(saveblock_pointer_stable and flag_bytes_stable)
+        route110_var_snapshot_valid = bool(
+            saveblock_pointer_stable and route110_var_snapshot_stable
+        )
         trainer_snapshot_valid = bool(flag_snapshot_valid and trainer_scan_stable)
 
         # Preserve the raw decoded location for diagnostics, but expose it to the
@@ -3232,6 +3319,11 @@ class EmeraldEnv(gym.Env):
             "raw_player_y": raw_player_y,
             "story_flags": effective_story_flags,
             "raw_story_flags": set(story_flags_raw),
+            "route110_state": (
+                int(route110_state_first) if route110_var_snapshot_valid else None
+            ),
+            "route110_state_raw": int(route110_state_first),
+            "route110_var_telemetry_valid": bool(route110_var_snapshot_valid),
             "trainer_flags": trainer_flags,
             "raw_trainer_flag_count": len(trainer_flags_first) if trainer_scan_performed else len(trainer_flags),
             "starter_flag_raw": starter_flag_raw,
@@ -3611,17 +3703,21 @@ class EmeraldEnv(gym.Env):
                 if not state.get("trainer_flag_telemetry_valid", False):
                     self.trainer_flag_telemetry_invalid_steps += 1
 
-                # Print the raw system-flag bytes when they change. This tells us
-                # whether a false starter bit comes from an actual byte change or
-                # from an unstable pointer/byte sample, without flooding every step.
+                # Raw flag-byte diagnostics are deliberately opt-in. VERBOSE=0/1
+                # keeps normal training output concise; VERBOSE=2 enables this
+                # low-level view when investigating SaveBlock1 telemetry.
+                # Do not include the pointer address in the change signature:
+                # SaveBlock1 can be relocated, and address-only changes are not
+                # evidence that the flag bytes or their validity changed.
                 raw_bytes = state.get("raw_flag_bytes", {})
                 flag_diag_signature = (
-                    state.get("saveblock1_ptr"),
                     raw_bytes.get("0x10C"),
                     raw_bytes.get("0x10D"),
                     bool(state.get("flag_telemetry_valid", False)),
+                    bool(state.get("saveblock_pointer_stable", False)),
+                    state.get("flag_telemetry_error"),
                 )
-                if flag_diag_signature != self._last_flag_diag_signature:
+                if VERBOSE_LEVEL >= 2 and flag_diag_signature != self._last_flag_diag_signature:
                     self._last_flag_diag_signature = flag_diag_signature
                     print(
                         f"[SaveBlock1 Flags] env={self.env_id} ptr=0x{int(state.get('saveblock1_ptr', 0)):08X} "
@@ -3640,7 +3736,7 @@ class EmeraldEnv(gym.Env):
                 # misclassified as battle EXP. This is a progress proxy, not a battle-screen
                 # or gBattleOutcome detector; trainer victories still use trainer flags below.
                 experience_delta = 0
-                if self.episode_step_counter % BATTLE_EXP_POLL_INTERVAL == 0:
+                if not NAVIGATION_OBJECTIVE and self.episode_step_counter % BATTLE_EXP_POLL_INTERVAL == 0:
                     current_party_experience = self._read_party_experience(live_party_count)
                     previous_party_experience = getattr(self, "prev_party_experience", None)
                     if current_party_experience is not None:
@@ -3658,7 +3754,7 @@ class EmeraldEnv(gym.Env):
                     else:
                         # Re-establish a clean baseline after invalid/transient RAM telemetry.
                         self.prev_party_experience = None
-                if live_party_count != saved_party_count:
+                if VERBOSE_LEVEL >= 2 and live_party_count != saved_party_count:
                     party_signature = (
                         live_party_count, saved_party_count, int(state["party_levels"]),
                         tuple(state.get("party_slot_levels", ())),
@@ -3680,7 +3776,10 @@ class EmeraldEnv(gym.Env):
                 # Level/party progress is delta-based and cannot be farmed by standing still.
                 previous_party_levels = self.prev_party_levels
                 level_delta = state["party_levels"] - previous_party_levels
-                component["level"] = max(0, level_delta) * LEVEL_REWARD_PER_LEVEL
+                component["level"] = (
+                    0.0 if NAVIGATION_OBJECTIVE
+                    else max(0, level_delta) * LEVEL_REWARD_PER_LEVEL
+                )
                 if MODE == "watch" and state["party_levels"] // 10 > previous_party_levels // 10:
                     send_notification(
                         "Pokémon Training Milestone",
@@ -3700,7 +3799,7 @@ class EmeraldEnv(gym.Env):
                         new_badge_bits = observed_badge_flags & (~self.seen_badge_flags & 0xFF)
                         new_badges = int(new_badge_bits).bit_count()
                         self.seen_badge_flags |= observed_badge_flags
-                component["badge"] = BADGE_REWARD * new_badges
+                component["badge"] = 0.0 if NAVIGATION_OBJECTIVE else BADGE_REWARD * new_badges
                 # Latch badge bits within the episode so a later failed read cannot
                 # revoke an earned badge or award it a second time.
                 state["badge_flags"] = int(self.seen_badge_flags)
@@ -3774,12 +3873,15 @@ class EmeraldEnv(gym.Env):
                     else:
                         new_story_flags = current_story_flags - self.seen_story_flags
                         self.seen_story_flags.update(current_story_flags)
-                component["story"] = sum(STORY_FLAG_REWARDS.get(flag, 0.0) for flag in new_story_flags)
+                component["story"] = (
+                    0.0 if NAVIGATION_OBJECTIVE
+                    else sum(STORY_FLAG_REWARDS.get(flag, 0.0) for flag in new_story_flags)
+                )
                 current_story_flags |= self.seen_story_flags
                 state["story_flags"] = current_story_flags
 
                 party_members_added = max(0, state["party_count"] - self.prev_caught_count)
-                component["party"] = PARTY_MEMBER_REWARD * party_members_added
+                component["party"] = 0.0 if NAVIGATION_OBJECTIVE else PARTY_MEMBER_REWARD * party_members_added
                 if party_members_added and MODE == "watch":
                     send_notification("Pokémon Party Expanded", f"Party size increased by {party_members_added}.")
                 self.prev_caught_count = state["party_count"]
@@ -3794,7 +3896,10 @@ class EmeraldEnv(gym.Env):
                     else:
                         new_trainer_flags = current_trainer_flags - self.seen_trainer_flags
                         self.seen_trainer_flags.update(current_trainer_flags)
-                component["trainer"] = min(4, len(new_trainer_flags)) * TRAINER_WIN_REWARD
+                component["trainer"] = (
+                    0.0 if NAVIGATION_OBJECTIVE
+                    else min(4, len(new_trainer_flags)) * TRAINER_WIN_REWARD
+                )
                 current_trainer_flags |= self.seen_trainer_flags
                 state["trainer_flags"] = current_trainer_flags
 
@@ -3806,8 +3911,10 @@ class EmeraldEnv(gym.Env):
                 # Small periodic anti-stagnation penalty; don't punish ordinary backtracking
                 # or every step. Novelty/progression resets the stagnation timer.
                 novelty_event = bool(
-                    new_tile_discovered or new_area_discovered or new_screen_discovered or new_story_flags or
-                    party_members_added or level_delta > 0 or new_badges or new_trainer_flags
+                    new_tile_discovered or new_area_discovered or new_screen_discovered
+                    or component["story"] > 0.0 or component["party"] > 0.0
+                    or component["level"] > 0.0 or component["badge"] > 0.0
+                    or component["trainer"] > 0.0 or component["battle_exp"] > 0.0
                 )
                 if novelty_event:
                     self.last_novelty_step = self.episode_step_counter
@@ -3834,6 +3941,20 @@ class EmeraldEnv(gym.Env):
                         component["loop"] = -LOOP_PENALTY * min(10, severity)
 
                 # The selected curriculum goal is evaluated from the decoded live state.
+                if CONTINUOUS_TOUR:
+                    if not hasattr(self, "_achieved_tour_stages"):
+                        self._achieved_tour_stages = set()
+                    for stage_name in STAGES:
+                        if stage_name not in self._achieved_tour_stages:
+                            if _objective_satisfied(stage_name, state):
+                                self._achieved_tour_stages.add(stage_name)
+                                print(
+                                    f"\n[Tour Milestone Achieved!] Stage: {stage_name} "
+                                    f"({OBJECTIVE_DEFINITIONS.get(stage_name, {}).get('label', stage_name)}) "
+                                    f"at step {self.episode_step_counter:,} | Total Badges: {state.get('badge_count', 0)}",
+                                    flush=True,
+                                )
+
                 # Reward it only on the transition into success, especially in watch mode.
                 task_success = _objective_satisfied(OBJECTIVE_NAME, state)
                 info["task_success"] = bool(task_success)
@@ -4011,11 +4132,15 @@ class EmeraldEnv(gym.Env):
                 if current_screen_signature is not None:
                     self.seen_screen_signatures.add(current_screen_signature)
                     self.screen_signature_history.append(current_screen_signature)
-            print(
-                f"[Mini-Episode] objective={OBJECTIVE_NAME} window={self.mini_episode_count} "
-                f"at_step={self.episode_step_counter:,}; game state, episode totals, and LSTM preserved.",
-                flush=True,
-            )
+            # Mini-episode boundaries are routine with the configured 5,000-step
+            # exploration window. At normal verbosity, report only worker 0; at
+            # VERBOSE=0 suppress the message, and at VERBOSE=2 show every worker.
+            if VERBOSE_LEVEL >= 2 or (VERBOSE_LEVEL >= 1 and self.env_id == 0):
+                print(
+                    f"[Mini-Episode] objective={OBJECTIVE_NAME} window={self.mini_episode_count} "
+                    f"at_step={self.episode_step_counter:,}; game state, episode totals, and LSTM preserved.",
+                    flush=True,
+                )
 
         reward = float(sum(component.values()))
         for component_name, component_value in component.items():
@@ -4121,6 +4246,11 @@ class EmeraldEnv(gym.Env):
             print("[GUI] Paused." if self.paused else "[GUI] Resumed.", flush=True)
             return None
 
+        if normalized in (ord("f"), ord("F"), ord(" ")):
+            self.fast_forward = not getattr(self, "fast_forward", False)
+            print(f"[GUI] Fast Forward {'ON' if self.fast_forward else 'OFF'}.", flush=True)
+            return None
+
         if normalized in (ord("m"), ord("M")):
             self._toggle_audio_mute()
             return None
@@ -4165,7 +4295,20 @@ class EmeraldEnv(gym.Env):
             )
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             status = "PAUSED" if self.paused else ("HUMAN SETUP" if MODE == "setup" else ("HOST CONTROL" if HOST_CONTROL_ENABLED and MODE == "watch" else "AI CONTROL"))
+            if getattr(self, "fast_forward", False):
+                status += " | FAST-FORWARD"
             cv2.putText(frame_bgr, status, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (40, 240, 80), 2, cv2.LINE_AA)
+
+            # Fast Forward toggle button
+            ff_active = bool(getattr(self, "fast_forward", False))
+            ff_label = "FF: ON (F)" if ff_active else "FF: OFF (F)"
+            ff_color = (0, 200, 220) if ff_active else (60, 60, 60)
+            fx1, fy1, fx2, fy2 = width - 360, 8, width - 226, 45
+            self._ff_button_rect = (fx1, fy1, fx2, fy2)
+            cv2.rectangle(frame_bgr, (fx1, fy1), (fx2, fy2), ff_color, thickness=-1)
+            cv2.rectangle(frame_bgr, (fx1, fy1), (fx2, fy2), (235, 235, 235), thickness=1)
+            text_color = (20, 20, 20) if ff_active else (255, 255, 255)
+            cv2.putText(frame_bgr, ff_label, (fx1 + 8, fy1 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.48, text_color, 1, cv2.LINE_AA)
 
             # The rectangle is both a visible status indicator and a clickable mute button.
             label = self._audio_gui_label()
@@ -4181,14 +4324,15 @@ class EmeraldEnv(gym.Env):
             cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (235, 235, 235), thickness=1)
             cv2.putText(frame_bgr, label, (x1 + 8, y1 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
 
+            ff_hint = "F/click FF: fast-forward"
             if self.audio_output is not None and self.audio_output.output_active:
                 mute_hint = "M/click Audio: mute" if self._mouse_callback_available else "M: mute"
             else:
                 mute_hint = "M: mute"
             if MODE == "setup":
-                footer = f"Arrows/WASD move | Z/Enter=A | X/Backspace=B | 1=Start | 2=Select | K=save start | q/Esc=quit | P=pause | {mute_hint}"
+                footer = f"Arrows/WASD move | Z/Enter=A | X/Backspace=B | 1=Start | 2=Select | K=save start | q/Esc=quit | P=pause | {ff_hint} | {mute_hint}"
             else:
-                footer = f"q/Esc: quit | P: pause | {mute_hint}"
+                footer = f"q/Esc: quit | P: pause | {ff_hint} | {mute_hint}"
             cv2.putText(frame_bgr, footer, (12, height - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45 if MODE == "setup" else 0.52, (255, 255, 255), 1, cv2.LINE_AA)
             cv2.imshow(GUI_WINDOW_TITLE, frame_bgr)
 
@@ -4211,7 +4355,7 @@ class EmeraldEnv(gym.Env):
                     pass
 
             elapsed = time.perf_counter() - frame_started
-            delay = max(0.0, (1.0 / max(1, GUI_FPS)) - elapsed)
+            delay = 0.0 if getattr(self, "fast_forward", False) else max(0.0, (1.0 / max(1, GUI_FPS)) - elapsed)
             if delay > 0 and not self.paused:
                 time.sleep(delay)
         except Exception as e:
@@ -4320,6 +4464,16 @@ class EmeraldEnv(gym.Env):
                 flush=True,
             )
             return False
+        if (
+            OBJECTIVE_NAME in OBJECTIVES_REQUIRING_VAR_TELEMETRY
+            and state.get("route110_var_telemetry_valid", False) is not True
+        ):
+            print(
+                "[Milestone Warning] Objective depends on the Route 110 progression variable, "
+                "but its SaveBlock1 reads were unstable; refusing to publish an unverified milestone.",
+                flush=True,
+            )
+            return False
         if not MILESTONE_SAVE_ENABLED:
             print("[Milestone Save] Disabled by POKEMON_AI_MILESTONE_SAVE=0.", flush=True)
             return False
@@ -4355,7 +4509,8 @@ class EmeraldEnv(gym.Env):
                 except OSError as exc:
                     print(f"[Milestone Warning] Could not fingerprint evaluation checkpoint: {exc}", flush=True)
         metadata = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "curriculum_plan": CURRICULUM_PLAN_ID,
             "objective": OBJECTIVE_NAME,
             "objective_label": OBJECTIVE_LABEL,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -4379,6 +4534,9 @@ class EmeraldEnv(gym.Env):
                 "badge_flags": int(state.get("badge_flags", 0)),
                 "badge_count": int(state.get("badge_count", 0)),
                 "story_flags": sorted(int(x) for x in story_flags),
+                "route110_state": state.get("route110_state"),
+                "route110_state_raw": state.get("route110_state_raw"),
+                "route110_var_telemetry_valid": bool(state.get("route110_var_telemetry_valid", True)),
                 "trainer_flag_count": len(trainer_flags),
                 "flag_telemetry_valid": bool(state.get("flag_telemetry_valid", True)),
                 "trainer_flag_telemetry_valid": bool(state.get("trainer_flag_telemetry_valid", True)),
@@ -4739,6 +4897,7 @@ class StopAndCheckpointCallback(BaseCallback):
         self._last_terminal_progress_timestep = 0
         self._run_start_timestep = 0
         self._run_started_at = 0.0
+        self._entropy_start_for_run = ENTROPY_COEF_START
         self._recent_rewards = deque(maxlen=1000)
         self._recent_actions = deque(maxlen=4096)  # actions actually sampled by PPO
         self._recent_greedy_actions = deque(maxlen=512)  # argmax actions on sampled training observations
@@ -4789,6 +4948,13 @@ class StopAndCheckpointCallback(BaseCallback):
         self._checkpoint_due = False
         self._stop_notice_printed = False
         self._run_start_timestep = int(self.num_timesteps)
+        saved_entropy_coef = _finite_number(getattr(self.model, "ent_coef", None))
+        force_stage_entropy_reset = _env_flag("POKEMON_AI_ENTROPY_RESET_FOR_STAGE", False)
+        self._entropy_start_for_run = (
+            ENTROPY_COEF_START
+            if force_stage_entropy_reset or saved_entropy_coef is None
+            else max(0.0, float(saved_entropy_coef))
+        )
         self._last_save_timestep = int(self.num_timesteps)
         self._last_progress_timestep = int(self.num_timesteps)
         self._last_terminal_progress_timestep = int(self.num_timesteps)
@@ -4801,7 +4967,7 @@ class StopAndCheckpointCallback(BaseCallback):
         try:
             with open(self._peak_metrics_path, "r", encoding="utf-8") as stream:
                 persisted = json.load(stream)
-            if isinstance(persisted, dict) and persisted.get("schema_version") == 1:
+            if isinstance(persisted, dict) and persisted.get("schema_version") in {1, 2}:
                 for key in self._peak_metrics:
                     value = _finite_number(persisted.get(key))
                     if value is not None and value >= 0:
@@ -4822,7 +4988,10 @@ class StopAndCheckpointCallback(BaseCallback):
             f"SB3 verbosity={VERBOSE_LEVEL} | mGBA log mask={_MGBA_LOG_LEVEL_MASK} | "
             f"checkpoint every {self.save_frequency:,} transitions | "
             f"TensorBoard flush every {self.progress_frequency:,} transitions | "
-            f"terminal table every {self.terminal_progress_frequency:,} transitions.",
+            f"terminal table every {self.terminal_progress_frequency:,} transitions | "
+            f"reward_profile={'navigation' if NAVIGATION_OBJECTIVE else 'progression'} | "
+            f"entropy_start={self._entropy_start_for_run:.4f}->{ENTROPY_COEF_END:.4f} "
+            f"({'stage-reset' if force_stage_entropy_reset else 'checkpoint-resume'}).",
             flush=True,
         )
 
@@ -4830,7 +4999,9 @@ class StopAndCheckpointCallback(BaseCallback):
         """Anneal entropy, restoring exploration pressure when sampled actions collapse."""
         elapsed = max(0, int(self.num_timesteps) - self._run_start_timestep)
         progress = min(1.0, elapsed / float(max(1, TOTAL_TIMESTEPS)))
-        scheduled = ENTROPY_COEF_START + (ENTROPY_COEF_END - ENTROPY_COEF_START) * progress
+        scheduled = self._entropy_start_for_run + (
+            ENTROPY_COEF_END - self._entropy_start_for_run
+        ) * progress
         counts = Counter(self._recent_actions)
         count_total = sum(counts.values())
         dominance = max(counts.values()) / count_total if count_total else 0.0
@@ -5761,7 +5932,7 @@ if __name__ == "__main__":
                 peak_metrics_path = os.path.join(RUNTIME_DATA_DIR, "training_metric_peaks.json")
                 try:
                     _atomic_write_json(peak_metrics_path, {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "party_count": 0.0,
                         "party_total_levels": 0.0,
                         "badge_count": 0.0,
@@ -5913,7 +6084,8 @@ if __name__ == "__main__":
             print(
                 f" [MODE] {'DETERMINISTIC' if EVAL_DETERMINISTIC else 'STOCHASTIC'} EVALUATION | "
                 f"objective={OBJECTIVE_LABEL} | episodes={EVAL_EPISODES} | "
-                f"max_steps={MAX_EPISODE_STEPS} | no_progress_stop={EVAL_NO_PROGRESS_STEPS} | seed={EVAL_SEED}."
+                f"max_steps={MAX_EPISODE_STEPS} | no_progress_stop={EVAL_NO_PROGRESS_STEPS} | seed={EVAL_SEED} | "
+                f"reward_profile={'navigation' if NAVIGATION_OBJECTIVE else 'progression'}."
             )
             print(" [MODE] Uses the mapped start state for this objective; no training updates, no GUI and no video.")
             print("--------------------------------------------------", flush=True)
@@ -5954,6 +6126,8 @@ if __name__ == "__main__":
             episode_starts = np.ones((int(getattr(model_env, "num_envs", 1)),), dtype=bool)
             results = []
             detailed_results = []
+            evaluation_stopped_early = False
+            evaluation_stop_reason = None
             for episode_index in range(1, EVAL_EPISODES + 1):
                 episode_return = 0.0
                 episode_steps = 0
@@ -6174,6 +6348,28 @@ if __name__ == "__main__":
                 print("\n" + _format_progress_table(
                     f"EVALUATION EPISODE {episode_index}/{EVAL_EPISODES}", episode_rows, width=None
                 ), flush=True)
+                # Do not spend the remaining evaluation budget once a promotion gate
+                # is mathematically impossible to reach. This is checked only between
+                # completed episodes; no action is overridden and no episode is cut short.
+                if EVAL_STOP_IF_GATE_UNREACHABLE and episode_index < EVAL_EPISODES:
+                    successes_so_far = sum(1 for success, *_ in results if success)
+                    if _evaluation_gate_unreachable(
+                        successes_so_far, len(results), EVAL_EPISODES, EVAL_SUCCESS_THRESHOLD
+                    ):
+                        evaluation_stopped_early = True
+                        evaluation_stop_reason = "gate_unreachable"
+                        max_possible_rate = (
+                            successes_so_far + (EVAL_EPISODES - len(results))
+                        ) / EVAL_EPISODES
+                        print(
+                            f"[Evaluation Early Stop] Gate is unreachable after {len(results)}/"
+                            f"{EVAL_EPISODES} episodes: successes={successes_so_far}, "
+                            f"best possible final rate={max_possible_rate:.1%}, "
+                            f"required={EVAL_SUCCESS_THRESHOLD:.1%}. Remaining episodes skipped.",
+                            flush=True,
+                        )
+                        break
+
                 # Vector envs auto-reset only after done. A stagnation stop is evaluator-side,
                 # so explicitly restore the canonical start before the next test episode.
                 if episode_outcome in {"STAGNATED", "UNKNOWN"} and episode_index < EVAL_EPISODES:
@@ -6195,13 +6391,20 @@ if __name__ == "__main__":
                     ("Failure modes", f"timeouts={timeouts} | stagnations={stagnations}"),
                 ]
                 print("\n" + _format_progress_table("EVALUATION SUMMARY", summary_rows, width=None), flush=True)
+                if evaluation_stopped_early:
+                    print(
+                        f"[Evaluation Summary] Early stop reason={evaluation_stop_reason}; "
+                        f"conservative success rate={successes / EVAL_EPISODES:.1%}; "
+                        f"best possible final rate={((successes + EVAL_EPISODES - len(results)) / EVAL_EPISODES):.1%}.",
+                        flush=True,
+                    )
             else:
                 print("[Evaluation Summary] No complete episodes were evaluated.", flush=True)
 
             if results:
                 report_successes = sum(1 for success, *_ in results if success)
                 report_payload = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "objective": OBJECTIVE_NAME,
                     "objective_label": OBJECTIVE_LABEL,
@@ -6215,6 +6418,14 @@ if __name__ == "__main__":
                     "episodes_completed": len(results),
                     "successes": int(report_successes),
                     "success_rate": float(report_successes / len(results)),
+                    "success_rate_over_requested": float(report_successes / EVAL_EPISODES),
+                    "success_rate_upper_bound": float(
+                        (report_successes + EVAL_EPISODES - len(results)) / EVAL_EPISODES
+                    ),
+                    "evaluation_stopped_early": bool(evaluation_stopped_early),
+                    "evaluation_stop_reason": evaluation_stop_reason,
+                    "evaluation_gate_threshold": float(EVAL_SUCCESS_THRESHOLD)
+                    if EVAL_STOP_IF_GATE_UNREACHABLE else None,
                     "mean_return": float(np.mean([r for _, r, _, _ in results])),
                     "mean_steps": float(np.mean([n for _, _, n, _ in results])),
                     "timeouts": int(sum(1 for _, _, _, outcome in results if outcome == "TIMEOUT")),

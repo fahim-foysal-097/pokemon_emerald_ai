@@ -15,17 +15,6 @@ spec.loader.exec_module(ct)
 
 class ConfigureTrainingTests(unittest.TestCase):
     def setUp(self):
-        self.stages = [
-            ct.StageInfo("starter", "starter", "Starter + opening battle"),
-            ct.StageInfo("leave_birch_lab", "exit Birch's Lab", "Enter Littleroot Town"),
-            ct.StageInfo("reach_route101", "reach Route 101", "Exit Littleroot Town"),
-            ct.StageInfo("reach_oldale", "reach Oldale", "Travel"),
-            ct.StageInfo("reach_route103", "reach Route 103", "Travel"),
-            ct.StageInfo("defeat_rival", "defeat rival", "Battle"),
-            ct.StageInfo("return_birch_lab", "return to lab", "Return"),
-            ct.StageInfo("pokedex", "obtain Pokédex", "Talk to Birch"),
-            ct.StageInfo("first_badge", "first badge", "Long objective"),
-        ]
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.project_dir = Path(temporary.name)
@@ -33,6 +22,7 @@ class ConfigureTrainingTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "curriculum_objectives.py",
             self.project_dir / "curriculum_objectives.py",
         )
+        self.stages = ct.load_stages(self.project_dir)
 
     def build(self, **kwargs):
         base = dict(
@@ -93,7 +83,9 @@ class ConfigureTrainingTests(unittest.TestCase):
             "defeat_rival": "runtime_data/states/milestones/reach_route103.state",
             "return_birch_lab": "runtime_data/states/milestones/defeat_rival.state",
             "pokedex": "runtime_data/states/milestones/return_birch_lab.state",
-            "first_badge": "runtime_data/states/milestones/pokedex.state",
+            "reach_route102": "runtime_data/states/milestones/pokedex.state",
+            "first_badge": "runtime_data/states/milestones/reach_rustboro.state",
+            "defeat_champion": "runtime_data/states/milestones/pass_victory_road.state",
         }
         for stage, suffix in expected.items():
             with self.subTest(stage=stage):
@@ -129,13 +121,25 @@ class ConfigureTrainingTests(unittest.TestCase):
 
     def test_curriculum_chunk_covers_longest_remaining_episode_and_rollout(self):
         plan = self.build(mode="curriculum", stage="reach_oldale")
-        self.assertEqual(plan.max_episode_steps, 64 * 2048)  # first_badge is longest remaining
+        self.assertEqual(plan.max_episode_steps, 128 * 2048)  # defeat_champion is longest remaining
         self.assertEqual(plan.chunk_transitions, plan.max_episode_steps * 4)
         self.assertEqual(plan.chunk_transitions % plan.rollout_size, 0)
         self.assertEqual(
             plan.curriculum_transitions,
             plan.remaining_stages * plan.chunks_per_stage * plan.chunk_transitions,
         )
+
+    def test_non_stage_only_plans_clear_a_stale_stage_only_episode_override(self):
+        for mode in ("stage", "curriculum"):
+            with self.subTest(mode=mode):
+                plan = self.build(mode=mode)
+                values = ct.values_for_plan(plan)
+                self.assertEqual(values["POKEMON_AI_CURRICULUM_TRAIN_MAX_EPISODE_STEPS"], "")
+
+    def test_stage_only_writes_explicit_curriculum_episode_cap(self):
+        plan = self.build(mode="stage-only", stage="reach_route101")
+        values = ct.values_for_plan(plan)
+        self.assertEqual(values["POKEMON_AI_CURRICULUM_TRAIN_MAX_EPISODE_STEPS"], str(20 * 2048))
 
     def test_stage_only_uses_one_duration_sized_chunk_and_separate_checkpoint_cadence(self):
         plan = self.build(mode="stage-only", stage="starter", hours=3, speed=80)
